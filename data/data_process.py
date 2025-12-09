@@ -126,7 +126,7 @@ class DataProcessor:
             # name: snapshot_symX_dateY_am/pm.csv
             try:
                 sym_part = name.split('_')[1]
-                date_part = name.split('_')[2]
+                date_part = name.split('_')[2] 
                 session_part = name.split('_')[3].split('.')[0]
                 sym_idx = int(sym_part.replace('sym', '').replace('sym', ''))
                 date_idx = int(date_part.replace('date', ''))

@@ -8,39 +8,42 @@ from data.data_process import DataProcessor
 from model.model import XGBoostModel
 
 
-def train_model(data_dir, label_name, model_save_dir, window=100, test_size=0.2, random_state=42, cache_dir='./cache', batch_size=10000, rounds_per_batch=20):
+def train_model(data_dir, label_name, model_save_dir, window=100, test_size=0.2, random_state=42, cache_dir='./cache'):
     print(f"Training model for {label_name}")
     print(f"Data directory: {data_dir}")
     print(f"Window size: {window}")
     
     processor = DataProcessor(data_dir)
     
+    print("Processing data and saving to binary DMatrix blocks...")
+    train_meta, val_meta, train_labels = processor.get_train_test_split(
+        label_name=label_name,
+        test_size=test_size,
+        random_state=random_state,
+        window=window,
+        cache_dir=cache_dir
+    )
+    
     import numpy as np
     import xgboost as xgb
-    from sklearn.metrics import accuracy_score, classification_report
     
-    # 划分文件以避免跨文件泄漏
-    train_files, val_files = processor._split_files(test_size)
-    print(f"Train files: {len(train_files)}, Val files: {len(val_files)}")
-    
-    # 仅统计标签分布，避免提前加载全部特征
     print("Calculating class weights...")
-    label_counts = processor.get_label_distribution(train_files, label_name)
-    total = sum(label_counts.values()) or 1
-    num_classes = len([v for v in label_counts.values() if v > 0]) or 1
-    class_weights = {lbl: (total / (num_classes * cnt)) if cnt > 0 else 1.0 for lbl, cnt in label_counts.items()}
-    print(f"Class distribution {label_counts}")
-    print(f"Class weights {class_weights}")
-
-    def train_generator():
-        base_gen = processor._load_and_process_files_generator(train_files, label_name, window, batch_size)
-        for X_batch, y_batch in base_gen:
-            weights = np.array([class_weights.get(int(lbl), 1.0) for lbl in y_batch])
-            yield X_batch, y_batch, weights
-
-    def val_generator():
-        for X_batch, y_batch in processor._load_and_process_files_generator(val_files, label_name, window, batch_size):
-            yield X_batch, y_batch
+    unique, counts = np.unique(train_labels, return_counts=True)
+    total = len(train_labels)
+    class_weights = {}
+    for label, count in zip(unique, counts):
+        class_weights[label] = total / (len(unique) * count)
+    print(f"Class distribution - Down: {counts[0]}, Unchanged: {counts[1]}, Up: {counts[2]}")
+    print(f"Class weights - Down: {class_weights.get(0, 1.0):.3f}, Unchanged: {class_weights.get(1, 1.0):.3f}, Up: {class_weights.get(2, 1.0):.3f}")
+    
+    print("Loading external memory DMatrix from meta files...")
+    dtrain = xgb.DMatrix(train_meta)
+    sample_weights = np.array([class_weights.get(label, 1.0) for label in train_labels])
+    dtrain.set_weight(sample_weights)
+    dval = xgb.DMatrix(val_meta)
+    
+    print(f"Train samples: {dtrain.num_row()}, Features: {dtrain.num_col()}")
+    print(f"Validation samples: {dval.num_row()}")
     
     model_params = {
         'objective': 'multi:softprob',
@@ -59,8 +62,8 @@ def train_model(data_dir, label_name, model_save_dir, window=100, test_size=0.2,
     }
     model = XGBoostModel(**model_params)
     
-    print("Training model (incremental batches)...")
-    model.fit_incremental(train_generator(), val_gen=val_generator(), rounds_per_batch=rounds_per_batch, early_stopping_rounds=10)
+    print("Training model...")
+    model.fit(dtrain, dval=dval, early_stopping_rounds=10)
     
     os.makedirs(model_save_dir, exist_ok=True)
     model_path = os.path.join(model_save_dir, f"model_{label_name}.pth")
@@ -68,23 +71,16 @@ def train_model(data_dir, label_name, model_save_dir, window=100, test_size=0.2,
     print(f"Model saved to: {model_path}")
     
     print("Evaluating on validation set...")
-    val_true = []
-    val_pred = []
-    val_proba = []
-    for X_batch, y_batch in val_generator():
-        dval_batch = xgb.DMatrix(X_batch)
-        batch_proba = model.predict_proba(dval_batch)
-        batch_pred = batch_proba.argmax(axis=1)
-        val_true.extend(y_batch.tolist())
-        val_pred.extend(batch_pred.tolist())
-        val_proba.append(batch_proba)
-    if val_true:
-        accuracy = accuracy_score(val_true, val_pred)
-        print(f"Validation Accuracy: {accuracy:.4f}")
-        print("\nClassification Report:")
-        print(classification_report(val_true, val_pred, target_names=['Down', 'Unchanged', 'Up']))
-    else:
-        print("Validation set is empty, skip evaluation.")
+    pred_proba = model.predict_proba(dval)
+    pred = pred_proba.argmax(axis=1)
+    
+    from sklearn.metrics import accuracy_score, classification_report
+    
+    val_labels = dval.get_label().astype(int)
+    accuracy = accuracy_score(val_labels, pred)
+    print(f"Validation Accuracy: {accuracy:.4f}")
+    print("\nClassification Report:")
+    print(classification_report(val_labels, pred, target_names=['Down', 'Unchanged', 'Up']))
     
     return model
 
@@ -100,8 +96,6 @@ def main():
     parser.add_argument('--window', type=int, default=100, help='Window size for historical features')
     parser.add_argument('--test_size', type=float, default=0.2, help='Test set size ratio')
     parser.add_argument('--random_state', type=int, default=42, help='Random state for reproducibility')
-    parser.add_argument('--batch_size', type=int, default=10000, help='Batch size when streaming features')
-    parser.add_argument('--rounds_per_batch', type=int, default=20, help='Boosting rounds per streamed batch')
     
     args = parser.parse_args()
     
@@ -116,9 +110,7 @@ def main():
             window=args.window,
             test_size=args.test_size,
             random_state=args.random_state,
-            cache_dir=args.cache_dir,
-            batch_size=args.batch_size,
-            rounds_per_batch=args.rounds_per_batch
+            cache_dir=args.cache_dir
         )
         print(f"{'='*60}\n")
     
