@@ -8,10 +8,11 @@ from data.data_process import DataProcessor
 from model.model import XGBoostModel
 
 
-def train_model(data_dir, label_name, model_save_dir, window=100, test_size=0.2, random_state=42, cache_dir='./cache'):
+def train_model(data_dir, label_name, model_save_dir, window=100, test_size=0.2, random_state=42, cache_dir='./cache', batch_size=5000):
     print(f"Training model for {label_name}")
     print(f"Data directory: {data_dir}")
     print(f"Window size: {window}")
+    print(f"Batch size: {batch_size}")
     
     processor = DataProcessor(data_dir)
     
@@ -21,7 +22,8 @@ def train_model(data_dir, label_name, model_save_dir, window=100, test_size=0.2,
         test_size=test_size,
         random_state=random_state,
         window=window,
-        cache_dir=cache_dir
+        cache_dir=cache_dir,
+        batch_size=batch_size
     )
     
     import numpy as np
@@ -97,6 +99,7 @@ def main():
     parser.add_argument('--window', type=int, default=100, help='Window size for historical features')
     parser.add_argument('--test_size', type=float, default=0.2, help='Test set size ratio')
     parser.add_argument('--random_state', type=int, default=42, help='Random state for reproducibility')
+    parser.add_argument('--batch_size', type=int, default=5000, help='Batch size for processing data blocks')
     
     args = parser.parse_args()
     
@@ -111,7 +114,8 @@ def main():
             window=args.window,
             test_size=args.test_size,
             random_state=args.random_state,
-            cache_dir=args.cache_dir
+            cache_dir=args.cache_dir,
+            batch_size=args.batch_size
         )
         print(f"{'='*60}\n")
     
