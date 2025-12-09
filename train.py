@@ -16,7 +16,7 @@ def train_model(data_dir, label_name, model_save_dir, window=100, test_size=0.2,
     processor = DataProcessor(data_dir)
     
     print("Processing data and saving to binary DMatrix blocks...")
-    train_meta, val_meta, train_labels = processor.get_train_test_split(
+    train_meta, val_meta, train_label_counts = processor.get_train_test_split(
         label_name=label_name,
         test_size=test_size,
         random_state=random_state,
@@ -28,16 +28,17 @@ def train_model(data_dir, label_name, model_save_dir, window=100, test_size=0.2,
     import xgboost as xgb
     
     print("Calculating class weights...")
-    unique, counts = np.unique(train_labels, return_counts=True)
-    total = len(train_labels)
+    total = sum(train_label_counts.values())
+    num_classes = len([v for v in train_label_counts.values() if v > 0])
     class_weights = {}
-    for label, count in zip(unique, counts):
-        class_weights[label] = total / (len(unique) * count)
-    print(f"Class distribution - Down: {counts[0]}, Unchanged: {counts[1]}, Up: {counts[2]}")
+    for label, count in train_label_counts.items():
+        class_weights[label] = total / (num_classes * count) if count > 0 else 1.0
+    print(f"Class distribution - Down: {train_label_counts.get(0, 0)}, Unchanged: {train_label_counts.get(1, 0)}, Up: {train_label_counts.get(2, 0)}")
     print(f"Class weights - Down: {class_weights.get(0, 1.0):.3f}, Unchanged: {class_weights.get(1, 1.0):.3f}, Up: {class_weights.get(2, 1.0):.3f}")
     
     print("Loading external memory DMatrix from meta files...")
     dtrain = xgb.DMatrix(train_meta)
+    train_labels = dtrain.get_label().astype(int)
     sample_weights = np.array([class_weights.get(label, 1.0) for label in train_labels])
     dtrain.set_weight(sample_weights)
     dval = xgb.DMatrix(val_meta)

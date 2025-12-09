@@ -107,12 +107,12 @@ class DataProcessor:
         available_features = [col for col in self.feature_columns if col in pd.read_csv(sample_file, nrows=1).columns]
         
         print("Processing training data and saving to binary DMatrix blocks...")
-        train_labels = self._process_and_save_binary_blocks(train_files, label_name, window, available_features, train_meta, cache_dir, batch_size)
+        train_label_counts = self._process_and_save_binary_blocks(train_files, label_name, window, available_features, train_meta, cache_dir, batch_size)
         
         print("Processing validation data and saving to binary DMatrix blocks...")
         self._process_and_save_binary_blocks(val_files, label_name, window, available_features, val_meta, cache_dir, batch_size)
         
-        return train_meta, val_meta, np.array(train_labels)
+        return train_meta, val_meta, train_label_counts
     
     def _split_files(self, test_size):
         pattern = os.path.join(self.data_dir, 'snapshot_sym*_date*_*.csv')
@@ -156,25 +156,28 @@ class DataProcessor:
     def _process_and_save_binary_blocks(self, csv_files, label_name, window, available_features, meta_path, cache_dir, batch_size=50000):
         batch_features = []
         batch_labels = []
-        all_labels = []
+        label_counts = {0: 0, 1: 0, 2: 0}
         buffer_files = []
         buffer_idx = 0
+        total_samples = 0
         
         base_name = os.path.splitext(os.path.basename(meta_path))[0]
         
         def save_buffer():
-            nonlocal buffer_idx, batch_features, batch_labels
+            nonlocal buffer_idx, batch_features, batch_labels, total_samples
             if not batch_features:
-                return
+                return 0
             X_batch = np.array(batch_features)
             y_batch = np.array(batch_labels)
             buffer_file = os.path.join(cache_dir, f'{base_name}_{buffer_idx}.buffer')
             dtrain_batch = xgb.DMatrix(X_batch, label=y_batch)
             dtrain_batch.save_binary(buffer_file)
+            num_samples = len(batch_labels)
             buffer_files.append(buffer_file)
             batch_features = []
             batch_labels = []
             buffer_idx += 1
+            return num_samples
         
         for file in tqdm(csv_files, desc="Processing files", ncols=80):
             df = pd.read_csv(file)
@@ -198,15 +201,16 @@ class DataProcessor:
                         hist_features = group_features[i-window+1:i+1]
                     
                     batch_features.append(hist_features.flatten())
-                    batch_labels.append(int(group_labels[i]))
-                    all_labels.append(int(group_labels[i]))
+                    label = int(group_labels[i])
+                    batch_labels.append(label)
+                    label_counts[label] = label_counts.get(label, 0) + 1
                     
                     if len(batch_features) >= batch_size:
-                        save_buffer()
+                        total_samples += save_buffer()
             
             del df, feature_df
         
-        save_buffer()
+        total_samples += save_buffer()
         
         if not buffer_files:
             raise ValueError("No data processed")
@@ -215,10 +219,9 @@ class DataProcessor:
             for buffer_file in buffer_files:
                 f.write(f'{buffer_file}\n')
         
-        total_samples = sum([xgb.DMatrix(bf).num_row() for bf in buffer_files])
         print(f"Saved {len(buffer_files)} binary DMatrix blocks to {meta_path} ({total_samples} total samples)")
         
-        return all_labels
+        return label_counts
     
     def create_features_batch_generator(self, df, label_name, window=100, batch_size=10000):
         """
