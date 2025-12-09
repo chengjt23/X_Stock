@@ -8,26 +8,51 @@ from data.data_process import DataProcessor
 from model.model import XGBoostModel
 
 
-def train_model(data_dir, label_name, model_save_dir, window=100, test_size=0.2, random_state=42, cache_dir='./cache', batch_size=5000):
+def train_model(data_dir, label_name, model_save_dir, window=100, test_size=0.2, random_state=42, cache_dir='./cache', batch_size=5000, use_cache=False):
     print(f"Training model for {label_name}")
     print(f"Data directory: {data_dir}")
     print(f"Window size: {window}")
     print(f"Batch size: {batch_size}")
-    
-    processor = DataProcessor(data_dir)
-    
-    print("Processing data and saving to binary DMatrix blocks...")
-    train_meta, val_meta, train_label_counts = processor.get_train_test_split(
-        label_name=label_name,
-        test_size=test_size,
-        random_state=random_state,
-        window=window,
-        cache_dir=cache_dir,
-        batch_size=batch_size
-    )
+    print(f"Use cache: {use_cache}")
     
     import numpy as np
     import xgboost as xgb
+    
+    train_meta = os.path.join(cache_dir, f'train_{label_name}.meta')
+    val_meta = os.path.join(cache_dir, f'val_{label_name}.meta')
+    
+    if use_cache:
+        if not os.path.exists(train_meta) or not os.path.exists(val_meta):
+            raise FileNotFoundError(f"Cache files not found. train_meta: {train_meta}, val_meta: {val_meta}")
+        
+        print("Using existing cache files...")
+        
+        with open(train_meta, 'r') as f:
+            buffer_files = [line.strip() for line in f if line.strip()]
+        
+        print("Calculating class weights from cache...")
+        label_counts = {0: 0, 1: 0, 2: 0}
+        for buffer_file in buffer_files:
+            if os.path.exists(buffer_file):
+                dm = xgb.DMatrix(buffer_file)
+                labels = dm.get_label().astype(int)
+                unique, counts = np.unique(labels, return_counts=True)
+                for label, count in zip(unique, counts):
+                    label_counts[int(label)] = label_counts.get(int(label), 0) + int(count)
+        
+        train_label_counts = label_counts
+    else:
+        processor = DataProcessor(data_dir)
+        
+        print("Processing data and saving to binary DMatrix blocks...")
+        train_meta, val_meta, train_label_counts = processor.get_train_test_split(
+            label_name=label_name,
+            test_size=test_size,
+            random_state=random_state,
+            window=window,
+            cache_dir=cache_dir,
+            batch_size=batch_size
+        )
     
     print("Calculating class weights...")
     total = sum(train_label_counts.values())
@@ -113,22 +138,24 @@ def train_model(data_dir, label_name, model_save_dir, window=100, test_size=0.2,
         params = model_params.copy()
         params.pop('num_boost_round', None)
         num_boost_round = model_params.get('num_boost_round', 500)
-        rounds_per_buffer = max(1, num_boost_round // len(buffer_files))
+        rounds_per_buffer = max(5, num_boost_round // max(1, len(buffer_files) // 10))
         
         first_train = next(train_gen)
         first_val = next(val_gen) if val_gen else None
         
+        print(f"Training on first buffer with {num_boost_round} rounds...")
         if first_val is not None:
             model.model = xgb.train(
                 params, first_train,
-                num_boost_round=rounds_per_buffer,
+                num_boost_round=num_boost_round,
                 evals=[(first_val, 'eval')],
                 early_stopping_rounds=10,
                 verbose_eval=20
             )
         else:
-            model.model = xgb.train(params, first_train, num_boost_round=rounds_per_buffer)
+            model.model = xgb.train(params, first_train, num_boost_round=num_boost_round)
         
+        buffer_idx = 1
         for train_dm in train_gen:
             val_dm = next(val_gen, None) if val_gen else None
             if val_dm is not None:
@@ -146,6 +173,9 @@ def train_model(data_dir, label_name, model_save_dir, window=100, test_size=0.2,
                     num_boost_round=rounds_per_buffer,
                     xgb_model=model.model
                 )
+            buffer_idx += 1
+            if buffer_idx % 50 == 0:
+                print(f"Processed {buffer_idx}/{len(buffer_files)} buffers...")
         
         dval = first_val if val_buffer_files else None
     
@@ -181,6 +211,7 @@ def main():
     parser.add_argument('--test_size', type=float, default=0.2, help='Test set size ratio')
     parser.add_argument('--random_state', type=int, default=42, help='Random state for reproducibility')
     parser.add_argument('--batch_size', type=int, default=5000, help='Batch size for processing data blocks')
+    parser.add_argument('--use_cache', action='store_true', default=False, help='Use existing cache files instead of processing data')
     
     args = parser.parse_args()
     
@@ -196,7 +227,8 @@ def main():
             test_size=args.test_size,
             random_state=args.random_state,
             cache_dir=args.cache_dir,
-            batch_size=args.batch_size
+            batch_size=args.batch_size,
+            use_cache=args.use_cache
         )
         print(f"{'='*60}\n")
     
