@@ -1,5 +1,7 @@
-import xgboost as xgb
 import pickle
+
+import numpy as np
+import xgboost as xgb
 
 
 class XGBoostModel:
@@ -51,26 +53,42 @@ class XGBoostModel:
         params.pop('num_boost_round', None)
         
         self.model = None
+
+        def _batch_to_dmatrix(batch):
+            if len(batch) == 3:
+                X, y, weights = batch
+                return xgb.DMatrix(X, label=y, weight=weights)
+            X, y = batch
+            return xgb.DMatrix(X, label=y)
+
+        def _build_validation_matrix(generator):
+            if generator is None:
+                return None
+            val_features = []
+            val_labels = []
+            for payload in generator:
+                X_val, y_val = payload[:2]
+                val_features.append(X_val)
+                val_labels.append(y_val)
+            if not val_features:
+                return None
+            X_stack = np.vstack(val_features)
+            y_stack = np.concatenate(val_labels)
+            dmatrix = xgb.DMatrix(X_stack, label=y_stack)
+            del val_features, val_labels, X_stack, y_stack
+            return dmatrix
         
         try:
             first_batch = next(train_gen)
-            if len(first_batch) == 3:
-                batch_X, batch_y, batch_weights = first_batch
-                dtrain = xgb.DMatrix(batch_X, label=batch_y, weight=batch_weights)
-            else:
-                batch_X, batch_y = first_batch
-                dtrain = xgb.DMatrix(batch_X, label=batch_y)
-            
-            dval = None
-            if val_gen is not None:
-                val_X, val_y = next(val_gen)
-                dval = xgb.DMatrix(val_X, label=val_y)
+            dtrain = _batch_to_dmatrix(first_batch)
+            dval = _build_validation_matrix(val_gen)
             
             if dval is not None:
                 self.model = xgb.train(
                     params, dtrain,
                     num_boost_round=rounds_per_batch,
                     evals=[(dval, 'eval')],
+                    early_stopping_rounds=early_stopping_rounds,
                     verbose_eval=20
                 )
             else:
@@ -78,12 +96,7 @@ class XGBoostModel:
             
             batch_count = 1
             for batch_data in train_gen:
-                if len(batch_data) == 3:
-                    batch_X, batch_y, batch_weights = batch_data
-                    dtrain_batch = xgb.DMatrix(batch_X, label=batch_y, weight=batch_weights)
-                else:
-                    batch_X, batch_y = batch_data
-                    dtrain_batch = xgb.DMatrix(batch_X, label=batch_y)
+                dtrain_batch = _batch_to_dmatrix(batch_data)
                 
                 if dval is not None:
                     self.model = xgb.train(
