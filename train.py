@@ -160,14 +160,21 @@ def train_model(data_dir, label_name, model_save_dir, window=100, test_size=0.2,
             for train_dm in train_gen:
                 val_dm = next(val_gen, None) if val_gen else None
                 if val_dm is not None:
+                    evals_result = {}
                     model.model = xgb.train(
                         params, train_dm,
                         num_boost_round=rounds_per_buffer,
                         xgb_model=model.model,
                         evals=[(val_dm, 'eval')],
+                        evals_result=evals_result,
                         early_stopping_rounds=10,
                         verbose_eval=False
                     )
+                    if evals_result and 'eval' in evals_result and 'mlogloss' in evals_result['eval']:
+                        loss_values = evals_result['eval']['mlogloss']
+                        current_loss = loss_values[-1] if loss_values else None
+                        if current_loss is not None:
+                            pbar.set_postfix({'loss': f'{current_loss:.4f}'})
                 else:
                     model.model = xgb.train(
                         params, train_dm,
