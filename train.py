@@ -32,7 +32,7 @@ def train_model(data_dir, label_name, model_save_dir, window=100, test_size=0.2,
             buffer_files = [line.strip() for line in f if line.strip()]
         
         label_counts = {0: 0, 1: 0, 2: 0}
-        for buffer_file in tqdm(buffer_files, desc="Calculating class weights from cache", ncols=80):
+        for buffer_file in tqdm(buffer_files, desc="Calculating class weights", ncols=80):
             if os.path.exists(buffer_file):
                 dm = xgb.DMatrix(buffer_file)
                 labels = dm.get_label().astype(int)
@@ -63,127 +63,91 @@ def train_model(data_dir, label_name, model_save_dir, window=100, test_size=0.2,
     print(f"Class distribution - Down: {train_label_counts.get(0, 0)}, Unchanged: {train_label_counts.get(1, 0)}, Up: {train_label_counts.get(2, 0)}")
     print(f"Class weights - Down: {class_weights.get(0, 1.0):.3f}, Unchanged: {class_weights.get(1, 1.0):.3f}, Up: {class_weights.get(2, 1.0):.3f}")
     
-    print("Loading external memory DMatrix from meta files...")
+    print("Loading buffer file lists...")
     with open(train_meta, 'r') as f:
         buffer_files = [line.strip() for line in f if line.strip()]
     
     with open(val_meta, 'r') as f:
         val_buffer_files = [line.strip() for line in f if line.strip()]
     
-    if len(buffer_files) == 1 and len(val_buffer_files) == 1:
-        dtrain = xgb.DMatrix(buffer_files[0])
-        train_labels = dtrain.get_label().astype(int)
-        sample_weights = np.array([class_weights.get(label, 1.0) for label in train_labels])
-        dtrain.set_weight(sample_weights)
-        dval = xgb.DMatrix(val_buffer_files[0])
+    print(f"Using external memory training with {len(buffer_files)} train buffers and {len(val_buffer_files)} val buffers")
+    
+    class DMatrixIterator(xgb.DataIter):
+        def __init__(self, buffer_files, class_weights=None, desc="Loading", cache_prefix=None):
+            self.buffer_files = buffer_files
+            self.class_weights = class_weights
+            self.current_idx = 0
+            self.desc = desc
+            self.pbar = None
+            self._cache_prefix = cache_prefix
+            super().__init__(cache_prefix=cache_prefix)
         
-        print(f"Train samples: {dtrain.num_row()}, Features: {dtrain.num_col()}")
-        print(f"Validation samples: {dval.num_row()}")
+        def next(self, input_data):
+            if self.current_idx >= len(self.buffer_files):
+                if self.pbar:
+                    self.pbar.close()
+                    self.pbar = None
+                return 0
+            if self.pbar is None:
+                self.pbar = tqdm(total=len(self.buffer_files), desc=self.desc, ncols=80)
+            dm = xgb.DMatrix(self.buffer_files[self.current_idx])
+            X = dm.get_data()
+            y = dm.get_label()
+            if self.class_weights:
+                w = np.array([self.class_weights.get(int(label), 1.0) for label in y])
+                input_data(data=X, label=y, weight=w)
+            else:
+                input_data(data=X, label=y)
+            self.current_idx += 1
+            self.pbar.update(1)
+            return 1
         
-        model_params = {
-            'objective': 'multi:softprob',
-            'num_class': 3,
-            'eval_metric': 'mlogloss',
-            'max_depth': 6,
-            'learning_rate': 0.1,
-            'num_boost_round': 500,
-            'subsample': 0.7,
-            'colsample_bytree': 0.7,
-            'reg_alpha': 0.1,
-            'reg_lambda': 1.0,
-            'random_state': random_state,
-            'nthread': 4,
-            'tree_method': 'hist'
-        }
-        model = XGBoostModel(**model_params)
-        
-        print("Training model...")
-        model.fit(dtrain, dval=dval, early_stopping_rounds=10)
-    else:
-        print(f"Using incremental training with {len(buffer_files)} train buffers and {len(val_buffer_files)} val buffers")
-        
-        def train_dmatrix_generator():
-            for buffer_file in buffer_files:
-                dm = xgb.DMatrix(buffer_file)
-                labels = dm.get_label().astype(int)
-                weights = np.array([class_weights.get(label, 1.0) for label in labels])
-                dm.set_weight(weights)
-                yield dm
-        
-        def val_dmatrix_generator():
-            for buffer_file in val_buffer_files:
-                yield xgb.DMatrix(buffer_file)
-        
-        model_params = {
-            'objective': 'multi:softprob',
-            'num_class': 3,
-            'eval_metric': 'mlogloss',
-            'max_depth': 6,
-            'learning_rate': 0.1,
-            'num_boost_round': 500,
-            'subsample': 0.7,
-            'colsample_bytree': 0.7,
-            'reg_alpha': 0.1,
-            'reg_lambda': 1.0,
-            'random_state': random_state,
-            'nthread': 4,
-            'tree_method': 'hist'
-        }
-        model = XGBoostModel(**model_params)
-        
-        print("Training model incrementally...")
-        train_gen = train_dmatrix_generator()
-        val_gen = val_dmatrix_generator() if val_buffer_files else None
-        
-        params = model_params.copy()
-        params.pop('num_boost_round', None)
-        num_boost_round = model_params.get('num_boost_round', 500)
-        rounds_per_buffer = max(5, num_boost_round // max(1, len(buffer_files) // 10))
-        
-        first_train = next(train_gen)
-        first_val = next(val_gen) if val_gen else None
-        
-        print(f"Training on first buffer with {num_boost_round} rounds...")
-        if first_val is not None:
-            model.model = xgb.train(
-                params, first_train,
-                num_boost_round=num_boost_round,
-                evals=[(first_val, 'eval')],
-                early_stopping_rounds=10,
-                verbose_eval=20
-            )
-        else:
-            model.model = xgb.train(params, first_train, num_boost_round=num_boost_round)
-        
-        remaining_buffers = len(buffer_files) - 1
-        with tqdm(total=remaining_buffers, desc="Training on buffers", ncols=80, initial=0) as pbar:
-            for train_dm in train_gen:
-                val_dm = next(val_gen, None) if val_gen else None
-                if val_dm is not None:
-                    evals_result = {}
-                    model.model = xgb.train(
-                        params, train_dm,
-                        num_boost_round=rounds_per_buffer,
-                        xgb_model=model.model,
-                        evals=[(val_dm, 'eval')],
-                        evals_result=evals_result,
-                        early_stopping_rounds=10,
-                        verbose_eval=False
-                    )
-                    if evals_result and 'eval' in evals_result and 'mlogloss' in evals_result['eval']:
-                        loss_values = evals_result['eval']['mlogloss']
-                        current_loss = loss_values[-1] if loss_values else None
-                        if current_loss is not None:
-                            pbar.set_postfix({'loss': f'{current_loss:.4f}'})
-                else:
-                    model.model = xgb.train(
-                        params, train_dm,
-                        num_boost_round=rounds_per_buffer,
-                        xgb_model=model.model
-                    )
-                pbar.update(1)
-        
-        dval = first_val if val_buffer_files else None
+        def reset(self):
+            self.current_idx = 0
+            if self.pbar:
+                self.pbar.close()
+                self.pbar = None
+    
+    print("Creating ExtMemQuantileDMatrix for true external memory training...")
+    train_cache = os.path.join(cache_dir, f"extmem_train_{label_name}")
+    val_cache = os.path.join(cache_dir, f"extmem_val_{label_name}")
+    
+    train_iter = DMatrixIterator(buffer_files, class_weights, desc="Loading train data", cache_prefix=train_cache)
+    dtrain = xgb.ExtMemQuantileDMatrix(train_iter, max_bin=256)
+    
+    val_iter = DMatrixIterator(val_buffer_files, desc="Loading val data", cache_prefix=val_cache)
+    dval = xgb.ExtMemQuantileDMatrix(val_iter, max_bin=256, ref=dtrain)
+    
+    print(f"Train samples: {dtrain.num_row()}, Features: {dtrain.num_col()}")
+    print(f"Validation samples: {dval.num_row()}")
+    
+    params = {
+        'objective': 'multi:softprob',
+        'num_class': 3,
+        'eval_metric': 'mlogloss',
+        'max_depth': 6,
+        'learning_rate': 0.05,
+        'subsample': 0.7,
+        'colsample_bytree': 0.7,
+        'reg_alpha': 0.1,
+        'reg_lambda': 1.0,
+        'random_state': random_state,
+        'nthread': -1,
+        'tree_method': 'hist'
+    }
+    
+    print("Training model with external memory (each tree covers all data)...")
+    xgb_model = xgb.train(
+        params,
+        dtrain,
+        num_boost_round=500,
+        evals=[(dval, 'eval')] if dval else None,
+        early_stopping_rounds=10,
+        verbose_eval=10
+    )
+    
+    model = XGBoostModel(**params)
+    model.model = xgb_model
     
     os.makedirs(model_save_dir, exist_ok=True)
     model_path = os.path.join(model_save_dir, f"model_{label_name}.pth")
