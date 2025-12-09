@@ -17,6 +17,20 @@ class DataProcessor:
             'n_ask4', 'n_asize4', 'n_ask5', 'n_asize5'
         ]
         self.label_columns = ['label_5', 'label_10', 'label_20', 'label_40', 'label_60']
+        self.label_horizons = {
+            'label_5': 5,
+            'label_10': 10,
+            'label_20': 20,
+            'label_40': 40,
+            'label_60': 60
+        }
+        self.alpha_thresholds = {
+            5: 0.0005,
+            10: 0.0005,
+            20: 0.001,
+            40: 0.001,
+            60: 0.001
+        }
     
     def load_all_data(self):
         pattern = os.path.join(self.data_dir, 'snapshot_sym*_date*_*.csv')
@@ -121,26 +135,105 @@ class DataProcessor:
         if not csv_files:
             raise ValueError(f"No CSV files found in {self.data_dir}")
         
-        def _parse(file_path):
-            name = os.path.basename(file_path)
-            # name: snapshot_symX_dateY_am/pm.csv
-            try:
-                sym_part = name.split('_')[1]
-                date_part = name.split('_')[2]
-                session_part = name.split('_')[3].split('.')[0]
-                sym_idx = int(sym_part.replace('sym', '').replace('sym', ''))
-                date_idx = int(date_part.replace('date', ''))
-                session_idx = 0 if 'am' in session_part else 1
-                return (date_idx, session_idx, sym_idx)
-            except Exception:
-                return (0, 0, 0)
+        file_infos = []
+        for file_path in csv_files:
+            date_idx, session_idx, sym_idx = self._parse_file_metadata(file_path)
+            file_infos.append((date_idx, session_idx, sym_idx, file_path))
         
-        csv_files = sorted(csv_files, key=_parse)
+        if not file_infos:
+            raise ValueError("No parsable CSV files were found.")
         
-        split_file_idx = int(len(csv_files) * (1 - test_size))
-        train_files = csv_files[:split_file_idx]
-        val_files = csv_files[split_file_idx:]
+        session_keys = sorted({(info[0], info[1]) for info in file_infos})
+        if len(session_keys) > 1:
+            split_idx = max(1, int(len(session_keys) * (1 - test_size)))
+            if split_idx >= len(session_keys):
+                split_idx = len(session_keys) - 1
+            train_key_set = set(session_keys[:split_idx])
+            val_key_set = set(session_keys[split_idx:])
+            train_files = [info[3] for info in file_infos if (info[0], info[1]) in train_key_set]
+            val_files = [info[3] for info in file_infos if (info[0], info[1]) in val_key_set]
+        else:
+            split_file_idx = max(1, int(len(file_infos) * (1 - test_size)))
+            if split_file_idx >= len(file_infos):
+                split_file_idx = len(file_infos) - 1
+            sorted_files = [info[3] for info in sorted(file_infos, key=lambda x: (x[0], x[1], x[2]))]
+            train_files = sorted_files[:split_file_idx]
+            val_files = sorted_files[split_file_idx:]
+        
+        if not val_files:
+            raise ValueError("Validation split is empty. Reduce test_size or provide more data.")
+        
         return train_files, val_files
+
+    def _parse_file_metadata(self, file_path):
+        name = os.path.basename(file_path)
+        try:
+            parts = name.split('_')
+            sym_part = parts[1] if len(parts) > 1 else 'sym0'
+            date_part = parts[2] if len(parts) > 2 else 'date0'
+            session_part = parts[3].split('.')[0] if len(parts) > 3 else ''
+            sym_idx = int(sym_part.replace('sym', '') or 0)
+            date_idx = int(date_part.replace('date', '') or 0)
+            session_lower = session_part.lower()
+            if 'pm' in session_lower:
+                session_idx = 1
+            else:
+                session_idx = 0
+            return date_idx, session_idx, sym_idx
+        except Exception:
+            return (0, 0, 0)
+
+    def _compute_midprice_series(self, df):
+        if 'midprice' in df.columns:
+            mid = df['midprice'].copy()
+        elif 'n_midprice' in df.columns:
+            mid = df['n_midprice'].copy()
+        elif {'ask1', 'bid1'}.issubset(df.columns):
+            ask = df['ask1'].fillna(0)
+            bid = df['bid1'].fillna(0)
+            mid = np.where(
+                (ask != 0) & (bid != 0),
+                (ask + bid) / 2,
+                np.where(bid == 0, ask, bid)
+            )
+            mid = pd.Series(mid, index=df.index)
+        else:
+            raise ValueError("Midprice columns not found (expected midprice/n_midprice or ask1/bid1).")
+        return mid
+
+    def verify_label_formula(self, df, label_names=None):
+        df = df.sort_values(['sym', 'date', 'time']).reset_index(drop=True)
+        label_names = label_names or self.label_columns
+        mid = self._compute_midprice_series(df)
+        df = df.copy()
+        df['_mid_'] = mid
+        grouped = df.groupby(['sym', 'date'], sort=False)
+        report = {}
+        for label in label_names:
+            if label not in df.columns or label not in self.label_horizons:
+                continue
+            horizon = self.label_horizons[label]
+            alpha = self.alpha_thresholds.get(horizon, 0.0005)
+            future_mid = grouped['_mid_'].shift(-horizon)
+            safe_mid = df['_mid_'].replace(0, np.nan)
+            rel_move = (future_mid - df['_mid_']) / safe_mid
+            calc = np.where(rel_move < -alpha, 0, np.where(rel_move > alpha, 2, 1))
+            invalid_mask = future_mid.isna() | safe_mid.isna()
+            calc = np.where(invalid_mask, np.nan, calc)
+            existing = df[label].to_numpy()
+            mismatches = np.sum((existing != calc) & ~np.isnan(calc))
+            total = int((~invalid_mask).sum())
+            report[label] = {
+                'total_checked': total,
+                'mismatched': int(mismatches),
+                'mismatch_rate': float(mismatches / total) if total else 0.0
+            }
+        df.drop(columns=['_mid_'], inplace=True)
+        return report
+
+    def verify_label_formula_from_file(self, file_path, label_names=None):
+        df = pd.read_csv(file_path)
+        return self.verify_label_formula(df, label_names=label_names)
 
     def get_label_distribution(self, csv_files, label_name):
         """
@@ -349,9 +442,9 @@ def main():
     dtrain = processor.process_data(args.label)
     print(f"Total data shape: {dtrain.num_row()} samples, {dtrain.num_col()} features")
     
-    dtrain_split, dtest_split = processor.get_train_test_split(args.label)
-    print(f"Train set: {dtrain_split.num_row()} samples")
-    print(f"Test set: {dtest_split.num_row()} samples")
+    train_meta, val_meta, train_labels = processor.get_train_test_split(args.label)
+    print(f"Binary blocks listed in: {train_meta} (train) and {val_meta} (val)")
+    print(f"Cached train rows (approx.): {len(train_labels)}")
     
     print("Data processing test completed successfully!")
 

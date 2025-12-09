@@ -22,6 +22,19 @@ def train_model(data_dir, label_name, model_save_dir, window=100, test_size=0.2,
     # 划分文件以避免跨文件泄漏
     train_files, val_files = processor._split_files(test_size)
     print(f"Train files: {len(train_files)}, Val files: {len(val_files)}")
+
+    audit_file = train_files[-1] if train_files else (val_files[-1] if val_files else None)
+    if audit_file:
+        try:
+            label_check = processor.verify_label_formula_from_file(audit_file, label_names=[label_name])
+            stats = label_check.get(label_name)
+            if stats:
+                mismatch_pct = stats['mismatch_rate'] * 100
+                print(f"Label audit ({label_name}): checked {stats['total_checked']} rows, mismatch {stats['mismatched']} ({mismatch_pct:.4f}%).")
+            else:
+                print(f"Label audit skipped: {label_name} not found in sampled file.")
+        except Exception as exc:
+            print(f"Warning: label verification failed for {audit_file}: {exc}")
     
     # 仅统计标签分布，避免提前加载全部特征
     print("Calculating class weights...")
