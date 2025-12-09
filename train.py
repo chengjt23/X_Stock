@@ -6,6 +6,7 @@ sys.path.append(os.path.dirname(os.path.abspath(__file__)))
 
 from data.data_process import DataProcessor
 from model.model import XGBoostModel
+from tqdm import tqdm
 
 
 def train_model(data_dir, label_name, model_save_dir, window=100, test_size=0.2, random_state=42, cache_dir='./cache', batch_size=5000, use_cache=False):
@@ -30,9 +31,8 @@ def train_model(data_dir, label_name, model_save_dir, window=100, test_size=0.2,
         with open(train_meta, 'r') as f:
             buffer_files = [line.strip() for line in f if line.strip()]
         
-        print("Calculating class weights from cache...")
         label_counts = {0: 0, 1: 0, 2: 0}
-        for buffer_file in buffer_files:
+        for buffer_file in tqdm(buffer_files, desc="Calculating class weights from cache", ncols=80):
             if os.path.exists(buffer_file):
                 dm = xgb.DMatrix(buffer_file)
                 labels = dm.get_label().astype(int)
@@ -155,27 +155,26 @@ def train_model(data_dir, label_name, model_save_dir, window=100, test_size=0.2,
         else:
             model.model = xgb.train(params, first_train, num_boost_round=num_boost_round)
         
-        buffer_idx = 1
-        for train_dm in train_gen:
-            val_dm = next(val_gen, None) if val_gen else None
-            if val_dm is not None:
-                model.model = xgb.train(
-                    params, train_dm,
-                    num_boost_round=rounds_per_buffer,
-                    xgb_model=model.model,
-                    evals=[(val_dm, 'eval')],
-                    early_stopping_rounds=10,
-                    verbose_eval=False
-                )
-            else:
-                model.model = xgb.train(
-                    params, train_dm,
-                    num_boost_round=rounds_per_buffer,
-                    xgb_model=model.model
-                )
-            buffer_idx += 1
-            if buffer_idx % 50 == 0:
-                print(f"Processed {buffer_idx}/{len(buffer_files)} buffers...")
+        remaining_buffers = len(buffer_files) - 1
+        with tqdm(total=remaining_buffers, desc="Training on buffers", ncols=80, initial=0) as pbar:
+            for train_dm in train_gen:
+                val_dm = next(val_gen, None) if val_gen else None
+                if val_dm is not None:
+                    model.model = xgb.train(
+                        params, train_dm,
+                        num_boost_round=rounds_per_buffer,
+                        xgb_model=model.model,
+                        evals=[(val_dm, 'eval')],
+                        early_stopping_rounds=10,
+                        verbose_eval=False
+                    )
+                else:
+                    model.model = xgb.train(
+                        params, train_dm,
+                        num_boost_round=rounds_per_buffer,
+                        xgb_model=model.model
+                    )
+                pbar.update(1)
         
         dval = first_val if val_buffer_files else None
     
