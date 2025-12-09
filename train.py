@@ -39,34 +39,115 @@ def train_model(data_dir, label_name, model_save_dir, window=100, test_size=0.2,
     print(f"Class weights - Down: {class_weights.get(0, 1.0):.3f}, Unchanged: {class_weights.get(1, 1.0):.3f}, Up: {class_weights.get(2, 1.0):.3f}")
     
     print("Loading external memory DMatrix from meta files...")
-    dtrain = xgb.DMatrix(train_meta)
-    train_labels = dtrain.get_label().astype(int)
-    sample_weights = np.array([class_weights.get(label, 1.0) for label in train_labels])
-    dtrain.set_weight(sample_weights)
-    dval = xgb.DMatrix(val_meta)
+    with open(train_meta, 'r') as f:
+        buffer_files = [line.strip() for line in f if line.strip()]
     
-    print(f"Train samples: {dtrain.num_row()}, Features: {dtrain.num_col()}")
-    print(f"Validation samples: {dval.num_row()}")
+    with open(val_meta, 'r') as f:
+        val_buffer_files = [line.strip() for line in f if line.strip()]
     
-    model_params = {
-        'objective': 'multi:softprob',
-        'num_class': 3,
-        'eval_metric': 'mlogloss',
-        'max_depth': 6,
-        'learning_rate': 0.1,
-        'num_boost_round': 500,
-        'subsample': 0.7,
-        'colsample_bytree': 0.7,
-        'reg_alpha': 0.1,
-        'reg_lambda': 1.0,
-        'random_state': random_state,
-        'nthread': 4,
-        'tree_method': 'hist'
-    }
-    model = XGBoostModel(**model_params)
-    
-    print("Training model...")
-    model.fit(dtrain, dval=dval, early_stopping_rounds=10)
+    if len(buffer_files) == 1 and len(val_buffer_files) == 1:
+        dtrain = xgb.DMatrix(buffer_files[0])
+        train_labels = dtrain.get_label().astype(int)
+        sample_weights = np.array([class_weights.get(label, 1.0) for label in train_labels])
+        dtrain.set_weight(sample_weights)
+        dval = xgb.DMatrix(val_buffer_files[0])
+        
+        print(f"Train samples: {dtrain.num_row()}, Features: {dtrain.num_col()}")
+        print(f"Validation samples: {dval.num_row()}")
+        
+        model_params = {
+            'objective': 'multi:softprob',
+            'num_class': 3,
+            'eval_metric': 'mlogloss',
+            'max_depth': 6,
+            'learning_rate': 0.1,
+            'num_boost_round': 500,
+            'subsample': 0.7,
+            'colsample_bytree': 0.7,
+            'reg_alpha': 0.1,
+            'reg_lambda': 1.0,
+            'random_state': random_state,
+            'nthread': 4,
+            'tree_method': 'hist'
+        }
+        model = XGBoostModel(**model_params)
+        
+        print("Training model...")
+        model.fit(dtrain, dval=dval, early_stopping_rounds=10)
+    else:
+        print(f"Using incremental training with {len(buffer_files)} train buffers and {len(val_buffer_files)} val buffers")
+        
+        def train_dmatrix_generator():
+            for buffer_file in buffer_files:
+                dm = xgb.DMatrix(buffer_file)
+                labels = dm.get_label().astype(int)
+                weights = np.array([class_weights.get(label, 1.0) for label in labels])
+                dm.set_weight(weights)
+                yield dm
+        
+        def val_dmatrix_generator():
+            for buffer_file in val_buffer_files:
+                yield xgb.DMatrix(buffer_file)
+        
+        model_params = {
+            'objective': 'multi:softprob',
+            'num_class': 3,
+            'eval_metric': 'mlogloss',
+            'max_depth': 6,
+            'learning_rate': 0.1,
+            'num_boost_round': 500,
+            'subsample': 0.7,
+            'colsample_bytree': 0.7,
+            'reg_alpha': 0.1,
+            'reg_lambda': 1.0,
+            'random_state': random_state,
+            'nthread': 4,
+            'tree_method': 'hist'
+        }
+        model = XGBoostModel(**model_params)
+        
+        print("Training model incrementally...")
+        train_gen = train_dmatrix_generator()
+        val_gen = val_dmatrix_generator() if val_buffer_files else None
+        
+        params = model_params.copy()
+        params.pop('num_boost_round', None)
+        num_boost_round = model_params.get('num_boost_round', 500)
+        rounds_per_buffer = max(1, num_boost_round // len(buffer_files))
+        
+        first_train = next(train_gen)
+        first_val = next(val_gen) if val_gen else None
+        
+        if first_val is not None:
+            model.model = xgb.train(
+                params, first_train,
+                num_boost_round=rounds_per_buffer,
+                evals=[(first_val, 'eval')],
+                early_stopping_rounds=10,
+                verbose_eval=20
+            )
+        else:
+            model.model = xgb.train(params, first_train, num_boost_round=rounds_per_buffer)
+        
+        for train_dm in train_gen:
+            val_dm = next(val_gen, None) if val_gen else None
+            if val_dm is not None:
+                model.model = xgb.train(
+                    params, train_dm,
+                    num_boost_round=rounds_per_buffer,
+                    xgb_model=model.model,
+                    evals=[(val_dm, 'eval')],
+                    early_stopping_rounds=10,
+                    verbose_eval=False
+                )
+            else:
+                model.model = xgb.train(
+                    params, train_dm,
+                    num_boost_round=rounds_per_buffer,
+                    xgb_model=model.model
+                )
+        
+        dval = first_val if val_buffer_files else None
     
     os.makedirs(model_save_dir, exist_ok=True)
     model_path = os.path.join(model_save_dir, f"model_{label_name}.pth")
