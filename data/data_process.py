@@ -41,7 +41,14 @@ class DataProcessor:
             'mid_price_1_mean', 'mid_price_1_std',
             'mid_price_3_mean', 'mid_price_3_std',
             'mid_price_5_mean', 'mid_price_5_std',
-            'time_seconds', 'time_interval'
+            'time_seconds', 'time_interval',
+            'bid1_plus1', 'bid3_plus1', 'bid5_plus1',
+            'ask1_plus1', 'ask3_plus1', 'ask5_plus1',
+            'cross_weighted_1', 'cross_weighted_2',
+            'midprice_ma5',
+            'volatility_5', 'volatility_10', 'volatility_20', 'volatility_40', 'volatility_60',
+            'macd_dif', 'macd_dea', 'macd_bar',
+            'kdj_k', 'kdj_d', 'kdj_j'
         ]
         self.label_columns = ['label_5', 'label_10', 'label_20', 'label_40', 'label_60']
     
@@ -124,6 +131,56 @@ class DataProcessor:
         
         df['midprice_mean'] = grouped['n_midprice'].transform(lambda x: x.rolling(window=10, min_periods=1).mean())
         df['midprice_std'] = grouped['n_midprice'].transform(lambda x: x.rolling(window=10, min_periods=1).std())
+        
+        for i in [1, 3, 5]:
+            df[f'bid{i}_plus1'] = df[f'n_bid{i}'] + 1
+            df[f'ask{i}_plus1'] = df[f'n_ask{i}'] + 1
+        
+        df['cross_weighted_1'] = (df['n_ask1'] * df['n_bsize2'] + df['n_ask2'] * df['n_bsize1']) / (df['n_bsize1'] + df['n_bsize2'] + 1e-10)
+        df['cross_weighted_2'] = (df['n_bid1'] * df['n_asize2'] + df['n_bid2'] * df['n_asize1']) / (df['n_asize1'] + df['n_asize2'] + 1e-10)
+        
+        df['midprice_ma5'] = grouped['n_midprice'].transform(lambda x: x.rolling(window=5, min_periods=1).mean())
+        
+        def calc_volatility(group, period):
+            result = []
+            for i in range(len(group)):
+                if i < period:
+                    result.append(0)
+                else:
+                    current = group.iloc[i]
+                    before = group.iloc[i-period]
+                    rate = (2 + current['n_ask1'] + current['n_bid1']) / (2 + before['n_ask1'] + before['n_bid1'] + 1e-10) - 1
+                    result.append(rate)
+            return pd.Series(result, index=group.index)
+        
+        for period in [5, 10, 20, 40, 60]:
+            df[f'volatility_{period}'] = grouped.apply(lambda x: calc_volatility(x, period)).values
+        
+        ema12 = grouped['n_midprice'].transform(lambda x: x.ewm(span=12, adjust=False).mean())
+        ema26 = grouped['n_midprice'].transform(lambda x: x.ewm(span=26, adjust=False).mean())
+        df['macd_dif'] = ema12 - ema26
+        df['macd_dea'] = grouped['macd_dif'].transform(lambda x: x.ewm(span=9, adjust=False).mean())
+        df['macd_bar'] = df['macd_dif'] - df['macd_dea']
+        
+        def calc_kdj(group):
+            close = group['n_midprice']
+            high = group['n_ask1']
+            low = group['n_bid1']
+            
+            low_9 = low.rolling(window=9, min_periods=1).min()
+            high_9 = high.rolling(window=9, min_periods=1).max()
+            
+            rsv = 100 * (close - low_9) / (high_9 - low_9 + 1e-10)
+            k = rsv.ewm(alpha=1/3, adjust=False).mean()
+            d = k.ewm(alpha=1/3, adjust=False).mean()
+            j = 3 * k - 2 * d
+            
+            return pd.DataFrame({'kdj_k': k, 'kdj_d': d, 'kdj_j': j}, index=group.index)
+        
+        kdj_result = grouped.apply(calc_kdj)
+        df['kdj_k'] = kdj_result['kdj_k'].values
+        df['kdj_d'] = kdj_result['kdj_d'].values
+        df['kdj_j'] = kdj_result['kdj_j'].values
         
         return df
     
