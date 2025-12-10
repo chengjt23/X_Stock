@@ -24,7 +24,23 @@ class DataProcessor:
             'amount_normalized',
             'log_bsize1', 'log_asize1', 'log_bsize3', 'log_asize3', 'log_bsize5', 'log_asize5',
             'close_delta', 'bid1_delta', 'ask1_delta', 'midprice_delta',
-            'close_mean', 'close_std', 'bid1_mean', 'ask1_mean', 'midprice_mean', 'midprice_std',
+            'close_mean', 'close_std', 'close_vs_mean',
+            'bid1_mean', 'bid1_std', 'bid1_vs_mean',
+            'bid3_mean', 'bid3_std', 'bid3_vs_mean',
+            'bid5_mean', 'bid5_std', 'bid5_vs_mean',
+            'ask1_mean', 'ask1_std', 'ask1_vs_mean',
+            'ask3_mean', 'ask3_std', 'ask3_vs_mean',
+            'ask5_mean', 'ask5_std', 'ask5_vs_mean',
+            'bsize1_mean', 'bsize1_std', 'bsize1_vs_mean',
+            'bsize3_mean', 'bsize3_std', 'bsize3_vs_mean',
+            'bsize5_mean', 'bsize5_std', 'bsize5_vs_mean',
+            'asize1_mean', 'asize1_std', 'asize1_vs_mean',
+            'asize3_mean', 'asize3_std', 'asize3_vs_mean',
+            'asize5_mean', 'asize5_std', 'asize5_vs_mean',
+            'midprice_mean', 'midprice_std',
+            'mid_price_1_mean', 'mid_price_1_std',
+            'mid_price_3_mean', 'mid_price_3_std',
+            'mid_price_5_mean', 'mid_price_5_std',
             'time_seconds', 'time_interval'
         ]
         self.label_columns = ['label_5', 'label_10', 'label_20', 'label_40', 'label_60']
@@ -84,8 +100,28 @@ class DataProcessor:
         
         df['close_mean'] = grouped['n_close'].transform(lambda x: x.rolling(window=10, min_periods=1).mean())
         df['close_std'] = grouped['n_close'].transform(lambda x: x.rolling(window=10, min_periods=1).std())
-        df['bid1_mean'] = grouped['n_bid1'].transform(lambda x: x.rolling(window=10, min_periods=1).mean())
-        df['ask1_mean'] = grouped['n_ask1'].transform(lambda x: x.rolling(window=10, min_periods=1).mean())
+        df['close_vs_mean'] = df['n_close'] / (df['close_mean'] + 1e-10)
+        
+        for i in [1, 3, 5]:
+            df[f'bid{i}_mean'] = grouped[f'n_bid{i}'].transform(lambda x: x.rolling(window=10, min_periods=1).mean())
+            df[f'bid{i}_std'] = grouped[f'n_bid{i}'].transform(lambda x: x.rolling(window=10, min_periods=1).std())
+            df[f'bid{i}_vs_mean'] = df[f'n_bid{i}'] / (df[f'bid{i}_mean'] + 1e-10)
+            
+            df[f'ask{i}_mean'] = grouped[f'n_ask{i}'].transform(lambda x: x.rolling(window=10, min_periods=1).mean())
+            df[f'ask{i}_std'] = grouped[f'n_ask{i}'].transform(lambda x: x.rolling(window=10, min_periods=1).std())
+            df[f'ask{i}_vs_mean'] = df[f'n_ask{i}'] / (df[f'ask{i}_mean'] + 1e-10)
+            
+            df[f'bsize{i}_mean'] = grouped[f'n_bsize{i}'].transform(lambda x: x.rolling(window=10, min_periods=1).mean())
+            df[f'bsize{i}_std'] = grouped[f'n_bsize{i}'].transform(lambda x: x.rolling(window=10, min_periods=1).std())
+            df[f'bsize{i}_vs_mean'] = df[f'n_bsize{i}'] / (df[f'bsize{i}_mean'] + 1e-10)
+            
+            df[f'asize{i}_mean'] = grouped[f'n_asize{i}'].transform(lambda x: x.rolling(window=10, min_periods=1).mean())
+            df[f'asize{i}_std'] = grouped[f'n_asize{i}'].transform(lambda x: x.rolling(window=10, min_periods=1).std())
+            df[f'asize{i}_vs_mean'] = df[f'n_asize{i}'] / (df[f'asize{i}_mean'] + 1e-10)
+            
+            df[f'mid_price_{i}_mean'] = grouped[f'mid_price_{i}'].transform(lambda x: x.rolling(window=10, min_periods=1).mean())
+            df[f'mid_price_{i}_std'] = grouped[f'mid_price_{i}'].transform(lambda x: x.rolling(window=10, min_periods=1).std())
+        
         df['midprice_mean'] = grouped['n_midprice'].transform(lambda x: x.rolling(window=10, min_periods=1).mean())
         df['midprice_std'] = grouped['n_midprice'].transform(lambda x: x.rolling(window=10, min_periods=1).std())
         
