@@ -24,7 +24,8 @@ class DataProcessor:
             'amount_normalized',
             'log_bsize1', 'log_asize1', 'log_bsize3', 'log_asize3', 'log_bsize5', 'log_asize5',
             'close_delta', 'bid1_delta', 'ask1_delta', 'midprice_delta',
-            'close_mean', 'close_std', 'bid1_mean', 'ask1_mean', 'midprice_mean', 'midprice_std'
+            'close_mean', 'close_std', 'bid1_mean', 'ask1_mean', 'midprice_mean', 'midprice_std',
+            'time_seconds', 'time_interval'
         ]
         self.label_columns = ['label_5', 'label_10', 'label_20', 'label_40', 'label_60']
     
@@ -48,6 +49,13 @@ class DataProcessor:
         return pd.concat(dataframes, ignore_index=True)
     
     def _add_derived_features(self, df):
+        def time_to_seconds(time_str):
+            parts = str(time_str).split(':')
+            return int(parts[0]) * 3600 + int(parts[1]) * 60 + int(parts[2])
+        
+        df['time_seconds'] = df['time'].apply(time_to_seconds)
+        df['time_interval'] = df['time_seconds'].apply(lambda x: min(int((x - 34200) / 1800), 7) if x >= 34200 else 0)
+        
         for i in [1, 3, 5]:
             df[f'spread_{i}'] = df[f'n_ask{i}'] - df[f'n_bid{i}']
             df[f'mid_price_{i}'] = (df[f'n_ask{i}'] + df[f'n_bid{i}']) / 2
