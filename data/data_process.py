@@ -14,7 +14,17 @@ class DataProcessor:
             'n_bid1', 'n_bsize1', 'n_bid2', 'n_bsize2', 'n_bid3', 'n_bsize3',
             'n_bid4', 'n_bsize4', 'n_bid5', 'n_bsize5',
             'n_ask1', 'n_asize1', 'n_ask2', 'n_asize2', 'n_ask3', 'n_asize3',
-            'n_ask4', 'n_asize4', 'n_ask5', 'n_asize5'
+            'n_ask4', 'n_asize4', 'n_ask5', 'n_asize5',
+            'spread_1', 'spread_3', 'spread_5',
+            'mid_price_1', 'mid_price_3', 'mid_price_5',
+            'relative_bid_density_1', 'relative_ask_density_1',
+            'relative_bid_density_3', 'relative_ask_density_3',
+            'weighted_ab_1', 'weighted_ab_3',
+            'vol1_rel_diff', 'vol3_rel_diff', 'vol5_rel_diff',
+            'amount_normalized',
+            'log_bsize1', 'log_asize1', 'log_bsize3', 'log_asize3', 'log_bsize5', 'log_asize5',
+            'close_delta', 'bid1_delta', 'ask1_delta', 'midprice_delta',
+            'close_mean', 'close_std', 'bid1_mean', 'ask1_mean', 'midprice_mean', 'midprice_std'
         ]
         self.label_columns = ['label_5', 'label_10', 'label_20', 'label_40', 'label_60']
     
@@ -37,8 +47,45 @@ class DataProcessor:
         
         return pd.concat(dataframes, ignore_index=True)
     
+    def _add_derived_features(self, df):
+        for i in [1, 3, 5]:
+            df[f'spread_{i}'] = df[f'n_ask{i}'] - df[f'n_bid{i}']
+            df[f'mid_price_{i}'] = (df[f'n_ask{i}'] + df[f'n_bid{i}']) / 2
+            total_size = df[f'n_bsize{i}'] + df[f'n_asize{i}']
+            df[f'relative_bid_density_{i}'] = df[f'n_bsize{i}'] / (total_size + 1e-10)
+            df[f'relative_ask_density_{i}'] = df[f'n_asize{i}'] / (total_size + 1e-10)
+        
+        for i in [1, 3]:
+            df[f'weighted_ab_{i}'] = (df[f'n_bid{i}'] * df[f'n_asize{i}'] + df[f'n_ask{i}'] * df[f'n_bsize{i}']) / (df[f'n_bsize{i}'] + df[f'n_asize{i}'] + 1e-10)
+        
+        df['vol1_rel_diff'] = (df['n_bsize1'] - df['n_asize1']) / (df['n_bsize1'] + df['n_asize1'] + 1e-10)
+        df['vol3_rel_diff'] = (df['n_bsize1'] + df['n_bsize2'] + df['n_bsize3'] - df['n_asize1'] - df['n_asize2'] - df['n_asize3']) / (df['n_bsize1'] + df['n_bsize2'] + df['n_bsize3'] + df['n_asize1'] + df['n_asize2'] + df['n_asize3'] + 1e-10)
+        df['vol5_rel_diff'] = (df['n_bsize1'] + df['n_bsize2'] + df['n_bsize3'] + df['n_bsize4'] + df['n_bsize5'] - df['n_asize1'] - df['n_asize2'] - df['n_asize3'] - df['n_asize4'] - df['n_asize5']) / (df['n_bsize1'] + df['n_bsize2'] + df['n_bsize3'] + df['n_bsize4'] + df['n_bsize5'] + df['n_asize1'] + df['n_asize2'] + df['n_asize3'] + df['n_asize4'] + df['n_asize5'] + 1e-10)
+        
+        df['amount_normalized'] = np.log1p(df['amount_delta'] / (1 + df['n_midprice']))
+        
+        for i in [1, 3, 5]:
+            df[f'log_bsize{i}'] = np.log1p(df[f'n_bsize{i}'])
+            df[f'log_asize{i}'] = np.log1p(df[f'n_asize{i}'])
+        
+        grouped = df.groupby(['sym', 'date'])
+        df['close_delta'] = grouped['n_close'].diff()
+        df['bid1_delta'] = grouped['n_bid1'].diff()
+        df['ask1_delta'] = grouped['n_ask1'].diff()
+        df['midprice_delta'] = grouped['n_midprice'].diff()
+        
+        df['close_mean'] = grouped['n_close'].transform(lambda x: x.rolling(window=10, min_periods=1).mean())
+        df['close_std'] = grouped['n_close'].transform(lambda x: x.rolling(window=10, min_periods=1).std())
+        df['bid1_mean'] = grouped['n_bid1'].transform(lambda x: x.rolling(window=10, min_periods=1).mean())
+        df['ask1_mean'] = grouped['n_ask1'].transform(lambda x: x.rolling(window=10, min_periods=1).mean())
+        df['midprice_mean'] = grouped['n_midprice'].transform(lambda x: x.rolling(window=10, min_periods=1).mean())
+        df['midprice_std'] = grouped['n_midprice'].transform(lambda x: x.rolling(window=10, min_periods=1).std())
+        
+        return df
+    
     def create_features(self, df, window=100):
         df = df.sort_values(['sym', 'date', 'time']).reset_index(drop=True)
+        df = self._add_derived_features(df)
         
         available_features = [col for col in self.feature_columns if col in df.columns]
         feature_df = df[available_features].copy()
@@ -182,6 +229,7 @@ class DataProcessor:
         for file in tqdm(csv_files, desc="Processing files", ncols=80):
             df = pd.read_csv(file)
             df = df.sort_values(['sym', 'date', 'time']).reset_index(drop=True)
+            df = self._add_derived_features(df)
             
             feature_df = df[available_features].copy()
             for col in feature_df.columns:
@@ -228,6 +276,7 @@ class DataProcessor:
         分批生成特征和标签，避免内存溢出
         """
         df = df.sort_values(['sym', 'date', 'time']).reset_index(drop=True)
+        df = self._add_derived_features(df)
         available_features = [col for col in self.feature_columns if col in df.columns]
         feature_df = df[available_features].copy()
         
@@ -302,6 +351,7 @@ class DataProcessor:
         for file in tqdm(csv_files, desc="Processing files", leave=False, ncols=80):
             df = pd.read_csv(file)
             df = df.sort_values(['sym', 'date', 'time']).reset_index(drop=True)
+            df = self._add_derived_features(df)
             
             feature_df = df[available_features].copy()
             for col in feature_df.columns:

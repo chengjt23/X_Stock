@@ -1,6 +1,7 @@
 import argparse
 import os
 import sys
+from datetime import datetime
 
 sys.path.append(os.path.dirname(os.path.abspath(__file__)))
 
@@ -8,16 +9,22 @@ from data.data_process import DataProcessor
 from model.model import XGBoostModel
 from tqdm import tqdm
 
+def tprint(*args, **kwargs):
+    timestamp = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+    print(f'[{timestamp}]', *args, **kwargs)
+
 
 def train_model(data_dir, label_name, model_save_dir, window=100, test_size=0.2, random_state=42, cache_dir='./cache', batch_size=5000, use_cache=False):
-    print(f"Training model for {label_name}")
-    print(f"Data directory: {data_dir}")
-    print(f"Window size: {window}")
-    print(f"Batch size: {batch_size}")
-    print(f"Use cache: {use_cache}")
-    
     import numpy as np
     import xgboost as xgb
+    
+    num_boost_round = 500
+    
+    tprint(f"Training model for {label_name}")
+    tprint(f"Data directory: {data_dir}")
+    tprint(f"Window size: {window}")
+    tprint(f"Batch size: {batch_size}")
+    tprint(f"Use cache: {use_cache}")
     
     train_meta = os.path.join(cache_dir, f'train_{label_name}.meta')
     val_meta = os.path.join(cache_dir, f'val_{label_name}.meta')
@@ -26,7 +33,7 @@ def train_model(data_dir, label_name, model_save_dir, window=100, test_size=0.2,
         if not os.path.exists(train_meta) or not os.path.exists(val_meta):
             raise FileNotFoundError(f"Cache files not found. train_meta: {train_meta}, val_meta: {val_meta}")
         
-        print("Using existing cache files...")
+        tprint("Using existing cache files...")
         
         with open(train_meta, 'r') as f:
             buffer_files = [line.strip() for line in f if line.strip()]
@@ -44,7 +51,7 @@ def train_model(data_dir, label_name, model_save_dir, window=100, test_size=0.2,
     else:
         processor = DataProcessor(data_dir)
         
-        print("Processing data and saving to binary DMatrix blocks...")
+        tprint("Processing data and saving to binary DMatrix blocks...")
         train_meta, val_meta, train_label_counts = processor.get_train_test_split(
             label_name=label_name,
             test_size=test_size,
@@ -54,23 +61,24 @@ def train_model(data_dir, label_name, model_save_dir, window=100, test_size=0.2,
             batch_size=batch_size
         )
     
-    print("Calculating class weights...")
+    tprint("Calculating class weights...")
     total = sum(train_label_counts.values())
     num_classes = len([v for v in train_label_counts.values() if v > 0])
     class_weights = {}
     for label, count in train_label_counts.items():
         class_weights[label] = total / (num_classes * count) if count > 0 else 1.0
-    print(f"Class distribution - Down: {train_label_counts.get(0, 0)}, Unchanged: {train_label_counts.get(1, 0)}, Up: {train_label_counts.get(2, 0)}")
-    print(f"Class weights - Down: {class_weights.get(0, 1.0):.3f}, Unchanged: {class_weights.get(1, 1.0):.3f}, Up: {class_weights.get(2, 1.0):.3f}")
     
-    print("Loading buffer file lists...")
+    tprint(f"Class distribution - Down: {train_label_counts.get(0, 0)}, Unchanged: {train_label_counts.get(1, 0)}, Up: {train_label_counts.get(2, 0)}")
+    tprint(f"Class weights - Down: {class_weights.get(0, 1.0):.3f}, Unchanged: {class_weights.get(1, 1.0):.3f}, Up: {class_weights.get(2, 1.0):.3f}")
+    
+    tprint("Loading buffer file lists...")
     with open(train_meta, 'r') as f:
         buffer_files = [line.strip() for line in f if line.strip()]
     
     with open(val_meta, 'r') as f:
         val_buffer_files = [line.strip() for line in f if line.strip()]
     
-    print(f"Using external memory training with {len(buffer_files)} train buffers and {len(val_buffer_files)} val buffers")
+    tprint(f"Using external memory training with {len(buffer_files)} train buffers and {len(val_buffer_files)} val buffers")
     
     class DMatrixIterator(xgb.DataIter):
         def __init__(self, buffer_files, class_weights=None, desc="Loading", cache_prefix=None):
@@ -108,7 +116,7 @@ def train_model(data_dir, label_name, model_save_dir, window=100, test_size=0.2,
                 self.pbar.close()
                 self.pbar = None
     
-    print("Creating ExtMemQuantileDMatrix for true external memory training...")
+    tprint("Creating ExtMemQuantileDMatrix for true external memory training...")
     train_cache = os.path.join(cache_dir, f"extmem_train_{label_name}")
     val_cache = os.path.join(cache_dir, f"extmem_val_{label_name}")
     
@@ -118,8 +126,8 @@ def train_model(data_dir, label_name, model_save_dir, window=100, test_size=0.2,
     val_iter = DMatrixIterator(val_buffer_files, desc="Loading val data", cache_prefix=val_cache)
     dval = xgb.ExtMemQuantileDMatrix(val_iter, max_bin=256, ref=dtrain)
     
-    print(f"Train samples: {dtrain.num_row()}, Features: {dtrain.num_col()}")
-    print(f"Validation samples: {dval.num_row()}")
+    tprint(f"Train samples: {dtrain.num_row()}, Features: {dtrain.num_col()}")
+    tprint(f"Validation samples: {dval.num_row()}")
     
     params = {
         'objective': 'multi:softprob',
@@ -136,11 +144,17 @@ def train_model(data_dir, label_name, model_save_dir, window=100, test_size=0.2,
         'tree_method': 'hist'
     }
     
-    print("Training model with external memory (each tree covers all data)...")
+    tprint("Training parameters:")
+    tprint(f"  batch_size: {batch_size}")
+    tprint(f"  num_boost_round: {num_boost_round}")
+    for key, value in params.items():
+        tprint(f"  {key}: {value}")
+    
+    tprint("Training model with external memory (each tree covers all data)...")
     xgb_model = xgb.train(
         params,
         dtrain,
-        num_boost_round=500,
+        num_boost_round=num_boost_round,
         evals=[(dval, 'eval')] if dval else None,
         early_stopping_rounds=10,
         verbose_eval=10
@@ -152,9 +166,9 @@ def train_model(data_dir, label_name, model_save_dir, window=100, test_size=0.2,
     os.makedirs(model_save_dir, exist_ok=True)
     model_path = os.path.join(model_save_dir, f"model_{label_name}.pth")
     model.save_model(model_path)
-    print(f"Model saved to: {model_path}")
+    tprint(f"Model saved to: {model_path}")
     
-    print("Evaluating on validation set...")
+    tprint("Evaluating on validation set...")
     pred_proba = model.predict_proba(dval)
     pred = pred_proba.argmax(axis=1)
     
@@ -162,9 +176,12 @@ def train_model(data_dir, label_name, model_save_dir, window=100, test_size=0.2,
     
     val_labels = dval.get_label().astype(int)
     accuracy = accuracy_score(val_labels, pred)
-    print(f"Validation Accuracy: {accuracy:.4f}")
-    print("\nClassification Report:")
-    print(classification_report(val_labels, pred, target_names=['Down', 'Unchanged', 'Up']))
+    tprint(f"Validation Accuracy: {accuracy:.4f}")
+    tprint("\nClassification Report:")
+    report = classification_report(val_labels, pred, target_names=['Down', 'Unchanged', 'Up'])
+    for line in report.split('\n'):
+        if line.strip():
+            tprint(line)
     
     return model
 
@@ -188,7 +205,7 @@ def main():
     labels = ['label_5', 'label_10', 'label_20', 'label_40', 'label_60'] if args.label == 'all' else [args.label]
     
     for label in labels:
-        print(f"\n{'='*60}")
+        tprint(f"\n{'='*60}")
         train_model(
             data_dir=args.data_dir,
             label_name=label,
@@ -200,9 +217,9 @@ def main():
             batch_size=args.batch_size,
             use_cache=args.use_cache
         )
-        print(f"{'='*60}\n")
+        tprint(f"{'='*60}\n")
     
-    print("All models trained successfully!")
+    tprint("All models trained successfully!")
 
 
 if __name__ == '__main__':
