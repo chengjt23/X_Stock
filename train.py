@@ -17,6 +17,7 @@ def tprint(*args, **kwargs):
 def train_model(data_dir, label_name, model_save_dir, window=100, test_size=0.2, random_state=42, cache_dir='./cache', batch_size=5000, use_cache=False):
     import numpy as np
     import xgboost as xgb
+    import gc
     
     num_boost_round = 500
     
@@ -46,6 +47,8 @@ def train_model(data_dir, label_name, model_save_dir, window=100, test_size=0.2,
                 unique, counts = np.unique(labels, return_counts=True)
                 for label, count in zip(unique, counts):
                     label_counts[int(label)] = label_counts.get(int(label), 0) + int(count)
+                del dm
+                gc.collect()
         
         train_label_counts = label_counts
     else:
@@ -104,8 +107,13 @@ def train_model(data_dir, label_name, model_save_dir, window=100, test_size=0.2,
             if self.class_weights:
                 w = np.array([self.class_weights.get(int(label), 1.0) for label in y])
                 input_data(data=X, label=y, weight=w)
+                del w
             else:
                 input_data(data=X, label=y)
+            
+            del dm, X, y
+            gc.collect()
+            
             self.current_idx += 1
             self.pbar.update(1)
             return 1
@@ -122,19 +130,55 @@ def train_model(data_dir, label_name, model_save_dir, window=100, test_size=0.2,
     
     train_iter = DMatrixIterator(buffer_files, class_weights, desc="Loading train data", cache_prefix=train_cache)
     dtrain = xgb.ExtMemQuantileDMatrix(train_iter, max_bin=256)
+    gc.collect()
+    tprint("Training data loaded, memory cleaned")
     
     val_iter = DMatrixIterator(val_buffer_files, desc="Loading val data", cache_prefix=val_cache)
     dval = xgb.ExtMemQuantileDMatrix(val_iter, max_bin=256, ref=dtrain)
+    gc.collect()
+    tprint("Validation data loaded, memory cleaned")
     
     tprint(f"Train samples: {dtrain.num_row()}, Features: {dtrain.num_col()}")
     tprint(f"Validation samples: {dval.num_row()}")
+    
+    num_features = dtrain.num_col()
+    processor_temp = DataProcessor(data_dir)
+    num_base_features = len([col for col in processor_temp.feature_columns])
+    tprint(f"\nFeature dimension details:")
+    tprint(f"  Base features: {num_base_features}")
+    tprint(f"  Window size: {window}")
+    tprint(f"  Total features per sample: {num_base_features} × {window} = {num_features}")
+    
+    tprint("\n=== Diagnosing Features ===")
+    with open(train_meta, 'r') as f:
+        first_buffer = f.readline().strip()
+    
+    if os.path.exists(first_buffer):
+        dm_test = xgb.DMatrix(first_buffer)
+        X_test = dm_test.get_data()
+        
+        if hasattr(X_test, 'toarray'):
+            X_dense = X_test.toarray()[:100]
+        else:
+            X_dense = X_test[:100]
+        
+        tprint(f"Sample shape (first 100): {X_dense.shape}")
+        tprint(f"Max value: {np.max(X_dense):.6f}, Min value: {np.min(X_dense):.6f}")
+        tprint(f"Mean: {np.mean(X_dense):.6f}, Std: {np.std(X_dense):.6f}")
+        tprint(f"Percentage of zeros: {100 * np.sum(X_dense == 0) / X_dense.size:.2f}%")
+        tprint(f"Number of NaN: {np.sum(np.isnan(X_dense))}")
+        tprint(f"Number of inf: {np.sum(np.isinf(X_dense))}")
+        
+        non_zero_cols = np.sum(X_dense != 0, axis=0) > 0
+        tprint(f"Non-zero columns: {np.sum(non_zero_cols)}/{X_dense.shape[1]}")
+        tprint("===========================\n")
     
     params = {
         'objective': 'multi:softprob',
         'num_class': 3,
         'eval_metric': 'mlogloss',
         'max_depth': 6,
-        'learning_rate': 0.05,
+        'learning_rate': 0.2,
         'subsample': 0.7,
         'colsample_bytree': 0.7,
         'reg_alpha': 0.1,

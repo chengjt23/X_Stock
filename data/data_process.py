@@ -141,20 +141,18 @@ class DataProcessor:
         
         df['midprice_ma5'] = grouped['n_midprice'].transform(lambda x: x.rolling(window=5, min_periods=1).mean())
         
-        def calc_volatility(group, period):
-            result = []
-            for i in range(len(group)):
-                if i < period:
-                    result.append(0)
-                else:
-                    current = group.iloc[i]
-                    before = group.iloc[i-period]
-                    rate = (2 + current['n_ask1'] + current['n_bid1']) / (2 + before['n_ask1'] + before['n_bid1'] + 1e-10) - 1
-                    result.append(rate)
-            return pd.Series(result, index=group.index)
-        
         for period in [5, 10, 20, 40, 60]:
-            df[f'volatility_{period}'] = grouped.apply(lambda x: calc_volatility(x, period)).values
+            vol_values = []
+            for (sym, date), group in grouped:
+                for i in range(len(group)):
+                    if i < period:
+                        vol_values.append(0)
+                    else:
+                        current_idx = group.index[i]
+                        before_idx = group.index[i-period]
+                        rate = (2 + df.loc[current_idx, 'n_ask1'] + df.loc[current_idx, 'n_bid1']) / (2 + df.loc[before_idx, 'n_ask1'] + df.loc[before_idx, 'n_bid1'] + 1e-10) - 1
+                        vol_values.append(rate)
+            df[f'volatility_{period}'] = vol_values
         
         ema12 = grouped['n_midprice'].transform(lambda x: x.ewm(span=12, adjust=False).mean())
         ema26 = grouped['n_midprice'].transform(lambda x: x.ewm(span=26, adjust=False).mean())
@@ -162,25 +160,43 @@ class DataProcessor:
         df['macd_dea'] = grouped['macd_dif'].transform(lambda x: x.ewm(span=9, adjust=False).mean())
         df['macd_bar'] = df['macd_dif'] - df['macd_dea']
         
-        def calc_kdj(group):
-            close = group['n_midprice']
-            high = group['n_ask1']
-            low = group['n_bid1']
+        kdj_k_list = []
+        kdj_d_list = []
+        kdj_j_list = []
+        
+        for (sym, date), group in grouped:
+            close = group['n_midprice'].values
+            high = group['n_ask1'].values
+            low = group['n_bid1'].values
             
-            low_9 = low.rolling(window=9, min_periods=1).min()
-            high_9 = high.rolling(window=9, min_periods=1).max()
+            low_9 = pd.Series(low).rolling(window=9, min_periods=1).min().values
+            high_9 = pd.Series(high).rolling(window=9, min_periods=1).max().values
             
             rsv = 100 * (close - low_9) / (high_9 - low_9 + 1e-10)
-            k = rsv.ewm(alpha=1/3, adjust=False).mean()
-            d = k.ewm(alpha=1/3, adjust=False).mean()
+            k = pd.Series(rsv).ewm(alpha=1/3, adjust=False).mean().values
+            d = pd.Series(k).ewm(alpha=1/3, adjust=False).mean().values
             j = 3 * k - 2 * d
             
-            return pd.DataFrame({'kdj_k': k, 'kdj_d': d, 'kdj_j': j}, index=group.index)
+            kdj_k_list.extend(k)
+            kdj_d_list.extend(d)
+            kdj_j_list.extend(j)
         
-        kdj_result = grouped.apply(calc_kdj)
-        df['kdj_k'] = kdj_result['kdj_k'].values
-        df['kdj_d'] = kdj_result['kdj_d'].values
-        df['kdj_j'] = kdj_result['kdj_j'].values
+        df['kdj_k'] = kdj_k_list
+        df['kdj_d'] = kdj_d_list
+        df['kdj_j'] = kdj_j_list
+        
+        # print(f"\n=== Feature Quality Check ===")
+        # sample_features = ['n_close', 'spread_1', 'volatility_5', 'macd_bar', 'kdj_k', 
+        #                   'close_mean', 'bid1_mean', 'vol1_rel_diff', 'amount_normalized']
+        # for col in sample_features:
+        #     if col in df.columns:
+        #         non_zero = (df[col] != 0).sum()
+        #         nan_count = df[col].isna().sum()
+        #         inf_count = np.isinf(df[col]).sum()
+        #         mean_val = df[col].replace([np.inf, -np.inf], np.nan).mean()
+        #         print(f"  {col:20s}: non-zero={non_zero:5d}/{len(df):5d} ({100*non_zero/len(df):5.1f}%), "
+        #               f"NaN={nan_count:4d}, inf={inf_count:4d}, mean={mean_val:.6f}")
+        # print("=============================\n")
         
         return df
     
@@ -192,7 +208,7 @@ class DataProcessor:
         feature_df = df[available_features].copy()
         
         for col in feature_df.columns:
-            feature_df[col] = feature_df[col].fillna(0)
+            feature_df[col] = feature_df[col].replace([np.inf, -np.inf], 0).fillna(0)
         
         grouped = df.groupby(['sym', 'date'])
         total_rows = len(df)
@@ -252,8 +268,17 @@ class DataProcessor:
         train_files, val_files = self._split_files(test_size)
         
         sample_file = train_files[0] if train_files else val_files[0]
-        available_features = [col for col in self.feature_columns if col in pd.read_csv(sample_file, nrows=1).columns]
+        sample_df = pd.read_csv(sample_file, nrows=100)
+        sample_df = self._add_derived_features(sample_df)
+        available_features = [col for col in self.feature_columns if col in sample_df.columns]
         
+        print(f"\n=== Feature Availability Check ===")
+        print(f"Total defined features: {len(self.feature_columns)}")
+        print(f"Available features after derivation: {len(available_features)}")
+        if len(available_features) < len(self.feature_columns):
+            missing_features = set(self.feature_columns) - set(available_features)
+            print(f"Missing features ({len(missing_features)}): {list(missing_features)[:10]}")
+        print("====================================\n")
         print("Processing training data and saving to binary DMatrix blocks...")
         train_label_counts = self._process_and_save_binary_blocks(train_files, label_name, window, available_features, train_meta, cache_dir, batch_size)
         
@@ -334,7 +359,7 @@ class DataProcessor:
             
             feature_df = df[available_features].copy()
             for col in feature_df.columns:
-                feature_df[col] = feature_df[col].fillna(0)
+                feature_df[col] = feature_df[col].replace([np.inf, -np.inf], 0).fillna(0)
             
             grouped = df.groupby(['sym', 'date'])
             for (sym, date), group in grouped:
@@ -382,7 +407,7 @@ class DataProcessor:
         feature_df = df[available_features].copy()
         
         for col in feature_df.columns:
-            feature_df[col] = feature_df[col].fillna(0)
+            feature_df[col] = feature_df[col].replace([np.inf, -np.inf], 0).fillna(0)
         
         grouped = df.groupby(['sym', 'date'])
         batch_features = []
@@ -456,7 +481,7 @@ class DataProcessor:
             
             feature_df = df[available_features].copy()
             for col in feature_df.columns:
-                feature_df[col] = feature_df[col].fillna(0)
+                feature_df[col] = feature_df[col].replace([np.inf, -np.inf], 0).fillna(0)
             
             grouped = df.groupby(['sym', 'date'])
             
