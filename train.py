@@ -208,7 +208,7 @@ def train_model(data_dir, label_name, model_save_dir, window=100, test_size=0.2,
     ckpt_callback = xgb.callback.TrainingCheckPoint(
         directory=checkpoint_dir,
         name=f"ckpt_{label_name}",
-        iterations=250 # 每隔250个 tree 存一次
+        interval=250 # 每隔250个 tree 存一次
     )
 
     tprint("Training model with external memory...")
