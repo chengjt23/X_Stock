@@ -9,7 +9,7 @@ from tqdm import tqdm
 class DataProcessor:
     def __init__(self, data_dir):
         self.data_dir = data_dir
-        self.feature_columns = [
+        self.base_feature_names = [
             'n_close', 'amount_delta', 'n_midprice',
             'n_bid1', 'n_bsize1', 'n_bid2', 'n_bsize2', 'n_bid3', 'n_bsize3',
             'n_bid4', 'n_bsize4', 'n_bid5', 'n_bsize5',
@@ -48,216 +48,296 @@ class DataProcessor:
             'midprice_ma5',
             'volatility_5', 'volatility_10', 'volatility_20', 'volatility_40', 'volatility_60',
             'macd_dif', 'macd_dea', 'macd_bar',
-            'kdj_k', 'kdj_d', 'kdj_j'
+            'kdj_k', 'kdj_d', 'kdj_j',
+            'roc_1', 'roc_5', 'roc_10', 'roc_30', 'roc_60', 'roc_100',
+            'vol1_rel_diff_mean_5', 'vol1_rel_diff_mean_20',
+            'price_zscore_20', 'price_zscore_100', 'price_zscore_300',
+            'price_slope_20', 'price_slope_100', 'price_slope_300',
+            'price_percentile_100',
+            'amount_zscore_20', 'amount_zscore_100', 'amount_zscore_300',
+            'amount_slope_20', 'amount_slope_100', 'amount_slope_300',
+            'lag_mid_1', 'lag_mid_5', 'lag_mid_20',
+            'lag_bid1_1', 'lag_bid1_5', 'lag_ask1_1', 'lag_ask1_5',
+            'lag_bsize1_1', 'lag_bsize1_5', 'lag_asize1_1', 'lag_asize1_5',
+            'volume_flow_5', 'volume_flow_20', 'volume_flow_60',
+            'total_imbalance', 'total_imbalance_weighted',
+            'bid_slope', 'ask_slope',
+            'price_elasticity_10', 'orderbook_pressure',
+            'ofi_1', 'ofi_avg_3', 'ofi_1_rolling_5', 'ofi_spread_ratio',
+            'midprice_accel', 'imb_velocity', 'imb_accel', 'energy_burst'
         ]
+        self.raw_snapshot_cols = [
+            'n_midprice', 'n_bid1', 'n_ask1', 'n_bsize1', 'n_asize1',
+            'vol1_rel_diff', 'spread_1', 'amount_delta'
+        ]
+        self.core_snapshot_cols = [
+            'n_midprice', 'n_bid1', 'n_ask1', 'n_bsize1', 'n_asize1', 
+            'vol1_rel_diff', 'spread_1', 'amount_delta'
+        ]
+        self.feature_columns = self.base_feature_names
+        self.final_feature_names = self._generate_final_names()
         self.label_columns = ['label_5', 'label_10', 'label_20', 'label_40', 'label_60']
     
-    def load_all_data(self):
-        pattern = os.path.join(self.data_dir, 'snapshot_sym*_date*_*.csv')
-        csv_files = glob.glob(pattern)
+    def _generate_final_names(self):
+        names = []
+        for lag in [0, 1, 2]:
+            names += [f"{c}_t{lag}" for c in self.base_feature_names]
+        for lag in [5, 10, 20, 40, 80, 100]:
+            names += [f"mid_lag{lag}", f"imb_lag{lag}"]
+        return names
+    
+    def _assemble_pyramid_vector(self, f_matrix, i, mid_idx, imb_idx):
+        full_frames = []
+        for lag in [0, 1, 2]:
+            idx = max(0, i - lag)
+            full_frames.append(f_matrix[idx])
         
-        if not csv_files:
-            raise ValueError(f"No CSV files found in {self.data_dir}")
+        history_samples = []
+        for lag in [5, 10, 20, 40, 80, 100]:
+            idx = max(0, i - lag)
+            history_samples.append([f_matrix[idx][mid_idx], f_matrix[idx][imb_idx]])
         
-        dataframes = []
-        for file in tqdm(csv_files, desc="Loading data", ncols=80):
-            try:
-                dataframes.append(pd.read_csv(file))
-            except Exception as e:
-                print(f"Warning: Failed to load {file}: {e}")
-        
-        if not dataframes:
-            raise ValueError("No valid CSV files were loaded")
-        
-        return pd.concat(dataframes, ignore_index=True)
+        return np.concatenate(full_frames + history_samples)
     
     def _add_derived_features(self, df):
+        feats = {}
+        
         def time_to_seconds(time_str):
             parts = str(time_str).split(':')
             return int(parts[0]) * 3600 + int(parts[1]) * 60 + int(parts[2])
         
-        df['time_seconds'] = df['time'].apply(time_to_seconds)
-        df['time_interval'] = df['time_seconds'].apply(lambda x: min(int((x - 34200) / 1800), 7) if x >= 34200 else 0)
+        t_seconds = df['time'].apply(time_to_seconds)
+        feats['time_seconds'] = t_seconds
+        feats['time_interval'] = t_seconds.apply(lambda x: min(int((x - 34200) / 1800), 7) if x >= 34200 else 0)
         
         for i in [1, 3, 5]:
-            df[f'spread_{i}'] = df[f'n_ask{i}'] - df[f'n_bid{i}']
-            df[f'mid_price_{i}'] = (df[f'n_ask{i}'] + df[f'n_bid{i}']) / 2
+            feats[f'spread_{i}'] = df[f'n_ask{i}'] - df[f'n_bid{i}']
+            feats[f'mid_price_{i}'] = (df[f'n_ask{i}'] + df[f'n_bid{i}']) / 2
             total_size = df[f'n_bsize{i}'] + df[f'n_asize{i}']
-            df[f'relative_bid_density_{i}'] = df[f'n_bsize{i}'] / (total_size + 1e-10)
-            df[f'relative_ask_density_{i}'] = df[f'n_asize{i}'] / (total_size + 1e-10)
+            feats[f'relative_bid_density_{i}'] = df[f'n_bsize{i}'] / (total_size + 1e-10)
+            feats[f'relative_ask_density_{i}'] = df[f'n_asize{i}'] / (total_size + 1e-10)
         
         for i in [1, 3]:
-            df[f'weighted_ab_{i}'] = (df[f'n_bid{i}'] * df[f'n_asize{i}'] + df[f'n_ask{i}'] * df[f'n_bsize{i}']) / (df[f'n_bsize{i}'] + df[f'n_asize{i}'] + 1e-10)
+            feats[f'weighted_ab_{i}'] = (df[f'n_bid{i}'] * df[f'n_asize{i}'] + df[f'n_ask{i}'] * df[f'n_bsize{i}']) / (df[f'n_bsize{i}'] + df[f'n_asize{i}'] + 1e-10)
         
-        df['vol1_rel_diff'] = (df['n_bsize1'] - df['n_asize1']) / (df['n_bsize1'] + df['n_asize1'] + 1e-10)
-        df['vol3_rel_diff'] = (df['n_bsize1'] + df['n_bsize2'] + df['n_bsize3'] - df['n_asize1'] - df['n_asize2'] - df['n_asize3']) / (df['n_bsize1'] + df['n_bsize2'] + df['n_bsize3'] + df['n_asize1'] + df['n_asize2'] + df['n_asize3'] + 1e-10)
-        df['vol5_rel_diff'] = (df['n_bsize1'] + df['n_bsize2'] + df['n_bsize3'] + df['n_bsize4'] + df['n_bsize5'] - df['n_asize1'] - df['n_asize2'] - df['n_asize3'] - df['n_asize4'] - df['n_asize5']) / (df['n_bsize1'] + df['n_bsize2'] + df['n_bsize3'] + df['n_bsize4'] + df['n_bsize5'] + df['n_asize1'] + df['n_asize2'] + df['n_asize3'] + df['n_asize4'] + df['n_asize5'] + 1e-10)
+        feats['vol1_rel_diff'] = (df['n_bsize1'] - df['n_asize1']) / (df['n_bsize1'] + df['n_asize1'] + 1e-10)
+        feats['vol3_rel_diff'] = (df['n_bsize1'] + df['n_bsize2'] + df['n_bsize3'] - df['n_asize1'] - df['n_asize2'] - df['n_asize3']) / (df['n_bsize1'] + df['n_bsize2'] + df['n_bsize3'] + df['n_asize1'] + df['n_asize2'] + df['n_asize3'] + 1e-10)
+        feats['vol5_rel_diff'] = (df['n_bsize1'] + df['n_bsize2'] + df['n_bsize3'] + df['n_bsize4'] + df['n_bsize5'] - df['n_asize1'] - df['n_asize2'] - df['n_asize3'] - df['n_asize4'] - df['n_asize5']) / (df['n_bsize1'] + df['n_bsize2'] + df['n_bsize3'] + df['n_bsize4'] + df['n_bsize5'] + df['n_asize1'] + df['n_asize2'] + df['n_asize3'] + df['n_asize4'] + df['n_asize5'] + 1e-10)
         
-        df['amount_normalized'] = np.log1p(df['amount_delta'] / (1 + df['n_midprice']))
+        feats['amount_normalized'] = np.log1p(df['amount_delta'] / (1 + df['n_midprice']))
         
         for i in [1, 3, 5]:
-            df[f'log_bsize{i}'] = np.log1p(df[f'n_bsize{i}'])
-            df[f'log_asize{i}'] = np.log1p(df[f'n_asize{i}'])
+            feats[f'log_bsize{i}'] = np.log1p(df[f'n_bsize{i}'])
+            feats[f'log_asize{i}'] = np.log1p(df[f'n_asize{i}'])
         
         grouped = df.groupby(['sym', 'date'])
-        df['close_delta'] = grouped['n_close'].diff()
-        df['bid1_delta'] = grouped['n_bid1'].diff()
-        df['ask1_delta'] = grouped['n_ask1'].diff()
-        df['midprice_delta'] = grouped['n_midprice'].diff()
+        feats['close_delta'] = grouped['n_close'].diff()
+        feats['bid1_delta'] = grouped['n_bid1'].diff()
+        feats['ask1_delta'] = grouped['n_ask1'].diff()
+        feats['midprice_delta'] = grouped['n_midprice'].diff()
         
-        df['close_mean'] = grouped['n_close'].transform(lambda x: x.rolling(window=10, min_periods=1).mean())
-        df['close_std'] = grouped['n_close'].transform(lambda x: x.rolling(window=10, min_periods=1).std())
-        df['close_vs_mean'] = df['n_close'] / (df['close_mean'] + 1e-10)
-        
-        for i in [1, 3, 5]:
-            df[f'bid{i}_mean'] = grouped[f'n_bid{i}'].transform(lambda x: x.rolling(window=10, min_periods=1).mean())
-            df[f'bid{i}_std'] = grouped[f'n_bid{i}'].transform(lambda x: x.rolling(window=10, min_periods=1).std())
-            df[f'bid{i}_vs_mean'] = df[f'n_bid{i}'] / (df[f'bid{i}_mean'] + 1e-10)
-            
-            df[f'ask{i}_mean'] = grouped[f'n_ask{i}'].transform(lambda x: x.rolling(window=10, min_periods=1).mean())
-            df[f'ask{i}_std'] = grouped[f'n_ask{i}'].transform(lambda x: x.rolling(window=10, min_periods=1).std())
-            df[f'ask{i}_vs_mean'] = df[f'n_ask{i}'] / (df[f'ask{i}_mean'] + 1e-10)
-            
-            df[f'bsize{i}_mean'] = grouped[f'n_bsize{i}'].transform(lambda x: x.rolling(window=10, min_periods=1).mean())
-            df[f'bsize{i}_std'] = grouped[f'n_bsize{i}'].transform(lambda x: x.rolling(window=10, min_periods=1).std())
-            df[f'bsize{i}_vs_mean'] = df[f'n_bsize{i}'] / (df[f'bsize{i}_mean'] + 1e-10)
-            
-            df[f'asize{i}_mean'] = grouped[f'n_asize{i}'].transform(lambda x: x.rolling(window=10, min_periods=1).mean())
-            df[f'asize{i}_std'] = grouped[f'n_asize{i}'].transform(lambda x: x.rolling(window=10, min_periods=1).std())
-            df[f'asize{i}_vs_mean'] = df[f'n_asize{i}'] / (df[f'asize{i}_mean'] + 1e-10)
-            
-            df[f'mid_price_{i}_mean'] = grouped[f'mid_price_{i}'].transform(lambda x: x.rolling(window=10, min_periods=1).mean())
-            df[f'mid_price_{i}_std'] = grouped[f'mid_price_{i}'].transform(lambda x: x.rolling(window=10, min_periods=1).std())
-        
-        df['midprice_mean'] = grouped['n_midprice'].transform(lambda x: x.rolling(window=10, min_periods=1).mean())
-        df['midprice_std'] = grouped['n_midprice'].transform(lambda x: x.rolling(window=10, min_periods=1).std())
+        feats['close_mean'] = grouped['n_close'].transform(lambda x: x.rolling(window=10, min_periods=1).mean())
+        feats['close_std'] = grouped['n_close'].transform(lambda x: x.rolling(window=10, min_periods=1).std())
+        feats['close_vs_mean'] = df['n_close'] / (feats['close_mean'] + 1e-10)
         
         for i in [1, 3, 5]:
-            df[f'bid{i}_plus1'] = df[f'n_bid{i}'] + 1
-            df[f'ask{i}_plus1'] = df[f'n_ask{i}'] + 1
+            feats[f'bid{i}_mean'] = grouped[f'n_bid{i}'].transform(lambda x: x.rolling(window=10, min_periods=1).mean())
+            feats[f'bid{i}_std'] = grouped[f'n_bid{i}'].transform(lambda x: x.rolling(window=10, min_periods=1).std())
+            feats[f'bid{i}_vs_mean'] = df[f'n_bid{i}'] / (feats[f'bid{i}_mean'] + 1e-10)
+            
+            feats[f'ask{i}_mean'] = grouped[f'n_ask{i}'].transform(lambda x: x.rolling(window=10, min_periods=1).mean())
+            feats[f'ask{i}_std'] = grouped[f'n_ask{i}'].transform(lambda x: x.rolling(window=10, min_periods=1).std())
+            feats[f'ask{i}_vs_mean'] = df[f'n_ask{i}'] / (feats[f'ask{i}_mean'] + 1e-10)
+            
+            feats[f'bsize{i}_mean'] = grouped[f'n_bsize{i}'].transform(lambda x: x.rolling(window=10, min_periods=1).mean())
+            feats[f'bsize{i}_std'] = grouped[f'n_bsize{i}'].transform(lambda x: x.rolling(window=10, min_periods=1).std())
+            feats[f'bsize{i}_vs_mean'] = df[f'n_bsize{i}'] / (feats[f'bsize{i}_mean'] + 1e-10)
+            
+            feats[f'asize{i}_mean'] = grouped[f'n_asize{i}'].transform(lambda x: x.rolling(window=10, min_periods=1).mean())
+            feats[f'asize{i}_std'] = grouped[f'n_asize{i}'].transform(lambda x: x.rolling(window=10, min_periods=1).std())
+            feats[f'asize{i}_vs_mean'] = df[f'n_asize{i}'] / (feats[f'asize{i}_mean'] + 1e-10)
+            
+            temp_mid_price_df = pd.DataFrame({'sym': df['sym'], 'date': df['date'], 'mid_price': feats[f'mid_price_{i}']}, index=df.index)
+            feats[f'mid_price_{i}_mean'] = temp_mid_price_df.groupby(['sym', 'date'])['mid_price'].transform(lambda x: x.rolling(window=10, min_periods=1).mean())
+            feats[f'mid_price_{i}_std'] = temp_mid_price_df.groupby(['sym', 'date'])['mid_price'].transform(lambda x: x.rolling(window=10, min_periods=1).std())
         
-        df['cross_weighted_1'] = (df['n_ask1'] * df['n_bsize2'] + df['n_ask2'] * df['n_bsize1']) / (df['n_bsize1'] + df['n_bsize2'] + 1e-10)
-        df['cross_weighted_2'] = (df['n_bid1'] * df['n_asize2'] + df['n_bid2'] * df['n_asize1']) / (df['n_asize1'] + df['n_asize2'] + 1e-10)
+        feats['midprice_mean'] = grouped['n_midprice'].transform(lambda x: x.rolling(window=10, min_periods=1).mean())
+        feats['midprice_std'] = grouped['n_midprice'].transform(lambda x: x.rolling(window=10, min_periods=1).std())
         
-        df['midprice_ma5'] = grouped['n_midprice'].transform(lambda x: x.rolling(window=5, min_periods=1).mean())
+        for i in [1, 3, 5]:
+            feats[f'bid{i}_plus1'] = df[f'n_bid{i}'] + 1
+            feats[f'ask{i}_plus1'] = df[f'n_ask{i}'] + 1
         
+        feats['cross_weighted_1'] = (df['n_ask1'] * df['n_bsize2'] + df['n_ask2'] * df['n_bsize1']) / (df['n_bsize1'] + df['n_bsize2'] + 1e-10)
+        feats['cross_weighted_2'] = (df['n_bid1'] * df['n_asize2'] + df['n_bid2'] * df['n_asize1']) / (df['n_asize1'] + df['n_asize2'] + 1e-10)
+        
+        feats['midprice_ma5'] = grouped['n_midprice'].transform(lambda x: x.rolling(window=5, min_periods=1).mean())
+        
+        temp_mid = 2 + df['n_ask1'] + df['n_bid1']
+        temp_mid_df = pd.DataFrame({'sym': df['sym'], 'date': df['date'], 'temp_mid': temp_mid}, index=df.index)
         for period in [5, 10, 20, 40, 60]:
-            vol_values = []
-            for (sym, date), group in grouped:
-                for i in range(len(group)):
-                    if i < period:
-                        vol_values.append(0)
-                    else:
-                        current_idx = group.index[i]
-                        before_idx = group.index[i-period]
-                        rate = (2 + df.loc[current_idx, 'n_ask1'] + df.loc[current_idx, 'n_bid1']) / (2 + df.loc[before_idx, 'n_ask1'] + df.loc[before_idx, 'n_bid1'] + 1e-10) - 1
-                        vol_values.append(rate)
-            df[f'volatility_{period}'] = vol_values
+            feats[f'volatility_{period}'] = temp_mid_df.groupby(['sym', 'date'])['temp_mid'].transform(
+                lambda x: (x / (x.shift(period) + 1e-10) - 1).fillna(0)
+            )
         
         ema12 = grouped['n_midprice'].transform(lambda x: x.ewm(span=12, adjust=False).mean())
         ema26 = grouped['n_midprice'].transform(lambda x: x.ewm(span=26, adjust=False).mean())
-        df['macd_dif'] = ema12 - ema26
-        df['macd_dea'] = grouped['macd_dif'].transform(lambda x: x.ewm(span=9, adjust=False).mean())
-        df['macd_bar'] = df['macd_dif'] - df['macd_dea']
+        feats['macd_dif'] = ema12 - ema26
+        temp_df = pd.DataFrame({'sym': df['sym'], 'date': df['date'], 'dif': feats['macd_dif']}, index=df.index)
+        feats['macd_dea'] = temp_df.groupby(['sym', 'date'])['dif'].transform(lambda x: x.ewm(span=9, adjust=False).mean())
+        feats['macd_bar'] = feats['macd_dif'] - feats['macd_dea']
         
-        kdj_k_list = []
-        kdj_d_list = []
-        kdj_j_list = []
+        low_9 = grouped['n_bid1'].transform(lambda x: x.rolling(window=9, min_periods=1).min())
+        high_9 = grouped['n_ask1'].transform(lambda x: x.rolling(window=9, min_periods=1).max())
+        rsv = 100 * (df['n_midprice'] - low_9) / (high_9 - low_9 + 1e-10)
         
-        for (sym, date), group in grouped:
-            close = group['n_midprice'].values
-            high = group['n_ask1'].values
-            low = group['n_bid1'].values
-            
-            low_9 = pd.Series(low).rolling(window=9, min_periods=1).min().values
-            high_9 = pd.Series(high).rolling(window=9, min_periods=1).max().values
-            
-            rsv = 100 * (close - low_9) / (high_9 - low_9 + 1e-10)
-            k = pd.Series(rsv).ewm(alpha=1/3, adjust=False).mean().values
-            d = pd.Series(k).ewm(alpha=1/3, adjust=False).mean().values
-            j = 3 * k - 2 * d
-            
-            kdj_k_list.extend(k)
-            kdj_d_list.extend(d)
-            kdj_j_list.extend(j)
+        rsv_df = pd.DataFrame({'sym': df['sym'], 'date': df['date'], 'rsv': rsv}, index=df.index)
+        feats['kdj_k'] = rsv_df.groupby(['sym', 'date'])['rsv'].transform(lambda x: x.ewm(alpha=1/3, adjust=False).mean())
         
-        df['kdj_k'] = kdj_k_list
-        df['kdj_d'] = kdj_d_list
-        df['kdj_j'] = kdj_j_list
+        k_df = pd.DataFrame({'sym': df['sym'], 'date': df['date'], 'k': feats['kdj_k']}, index=df.index)
+        feats['kdj_d'] = k_df.groupby(['sym', 'date'])['k'].transform(lambda x: x.ewm(alpha=1/3, adjust=False).mean())
+        feats['kdj_j'] = 3 * feats['kdj_k'] - 2 * feats['kdj_d']
         
-        # print(f"\n=== Feature Quality Check ===")
-        # sample_features = ['n_close', 'spread_1', 'volatility_5', 'macd_bar', 'kdj_k', 
-        #                   'close_mean', 'bid1_mean', 'vol1_rel_diff', 'amount_normalized']
-        # for col in sample_features:
-        #     if col in df.columns:
-        #         non_zero = (df[col] != 0).sum()
-        #         nan_count = df[col].isna().sum()
-        #         inf_count = np.isinf(df[col]).sum()
-        #         mean_val = df[col].replace([np.inf, -np.inf], np.nan).mean()
-        #         print(f"  {col:20s}: non-zero={non_zero:5d}/{len(df):5d} ({100*non_zero/len(df):5.1f}%), "
-        #               f"NaN={nan_count:4d}, inf={inf_count:4d}, mean={mean_val:.6f}")
-        # print("=============================\n")
-        
-        return df
+        new_df = pd.concat([df, pd.DataFrame(feats, index=df.index)], axis=1)
+        new_df = self._add_advanced_features(new_df)
+        return new_df.copy()
     
-    def create_features(self, df, window=100):
-        df = df.sort_values(['sym', 'date', 'time']).reset_index(drop=True)
-        df = self._add_derived_features(df)
-        
-        available_features = [col for col in self.feature_columns if col in df.columns]
-        feature_df = df[available_features].copy()
-        
-        for col in feature_df.columns:
-            feature_df[col] = feature_df[col].replace([np.inf, -np.inf], 0).fillna(0)
-        
+    def _add_advanced_features(self, df):
         grouped = df.groupby(['sym', 'date'])
-        total_rows = len(df)
+        feats = {}
         
-        feature_list = []
-        processed_rows = 0
-        pbar = tqdm(total=total_rows, desc="Creating features", ncols=80)
+        mid = df['n_midprice']
         
-        for (sym, date), group in grouped:
-            group_features = feature_df.loc[group.index].values
+        for w in [1, 5, 10, 30, 60, 100]:
+            feats[f'roc_{w}'] = grouped['n_midprice'].transform(lambda x: x / x.shift(w) - 1).fillna(0)
+        
+        vol1_rel_diff = df['vol1_rel_diff'] if 'vol1_rel_diff' in df.columns else (df['n_bsize1'] - df['n_asize1']) / (df['n_bsize1'] + df['n_asize1'] + 1e-10)
+        vol1_df = pd.DataFrame({'sym': df['sym'], 'date': df['date'], 'vol1': vol1_rel_diff}, index=df.index)
+        feats['vol1_rel_diff_mean_5'] = vol1_df.groupby(['sym', 'date'])['vol1'].transform(lambda x: x.rolling(window=5, min_periods=1).mean()).fillna(0)
+        feats['vol1_rel_diff_mean_20'] = vol1_df.groupby(['sym', 'date'])['vol1'].transform(lambda x: x.rolling(window=20, min_periods=1).mean()).fillna(0)
+        
+        for window in [20, 100, 300]:
+            roll_mid = grouped['n_midprice'].rolling(window=window, min_periods=1)
+            mid_mean = roll_mid.mean().reset_index(level=[0,1], drop=True)
+            mid_std = roll_mid.std().reset_index(level=[0,1], drop=True)
+            feats[f'price_zscore_{window}'] = (mid - mid_mean) / (mid_std + 1e-10)
             
-            for i in range(len(group)):
-                if i < window - 1:
-                    hist_features = group_features[:i+1]
-                    padding = np.zeros((window - i - 1, len(available_features)))
-                    hist_features = np.vstack([padding, hist_features])
-                else:
-                    hist_features = group_features[i-window+1:i+1]
-                
-                feature_list.append(hist_features.flatten())
-                processed_rows += 1
-                pbar.update(1)
+            mid_recent_mean = grouped['n_midprice'].transform(lambda x: x.rolling(window=window//3, min_periods=1).mean())
+            mid_early_mean = grouped['n_midprice'].transform(lambda x: x.shift(window*2//3).rolling(window=window//3, min_periods=1).mean())
+            feats[f'price_slope_{window}'] = (mid_recent_mean - mid_early_mean) / (window * 2 // 3 + 1e-10)
+            
+            roll_amount = grouped['amount_delta'].rolling(window=window, min_periods=1)
+            amount_mean = roll_amount.mean().reset_index(level=[0,1], drop=True)
+            amount_std = roll_amount.std().reset_index(level=[0,1], drop=True)
+            feats[f'amount_zscore_{window}'] = (df['amount_delta'] - amount_mean) / (amount_std + 1e-10)
+            
+            amount_recent_mean = grouped['amount_delta'].transform(lambda x: x.rolling(window=window//3, min_periods=1).mean())
+            amount_early_mean = grouped['amount_delta'].transform(lambda x: x.shift(window*2//3).rolling(window=window//3, min_periods=1).mean())
+            feats[f'amount_slope_{window}'] = (amount_recent_mean - amount_early_mean) / (window * 2 // 3 + 1e-10)
         
-        pbar.close()
-        return np.array(feature_list)
-    
-    def process_data(self, label_name='label_5', window=100):
-        print("Processing data...")
-        df = self.load_all_data()
-        print("Data loaded successfully")
+        roll100_max = grouped['n_midprice'].rolling(window=100, min_periods=1).max().reset_index(level=[0,1], drop=True)
+        roll100_min = grouped['n_midprice'].rolling(window=100, min_periods=1).min().reset_index(level=[0,1], drop=True)
+        feats['price_percentile_100'] = (mid - roll100_min) / (roll100_max - roll100_min + 1e-10)
         
-        if label_name not in self.label_columns:
-            raise ValueError(f"Label {label_name} not found. Available labels: {self.label_columns}")
+        total_bid_size = df['n_bsize1'] + df['n_bsize2'] + df['n_bsize3'] + df['n_bsize4'] + df['n_bsize5']
+        total_ask_size = df['n_asize1'] + df['n_asize2'] + df['n_asize3'] + df['n_asize4'] + df['n_asize5']
+        feats['total_imbalance'] = (total_bid_size - total_ask_size) / (total_bid_size + total_ask_size + 1e-10)
         
-        df = df.sort_values(['sym', 'date', 'time']).reset_index(drop=True)
-        available_features = [col for col in self.feature_columns if col in df.columns]
+        weighted_bid = (df['n_bid1'] * df['n_bsize1'] + df['n_bid2'] * df['n_bsize2'] + 
+                       df['n_bid3'] * df['n_bsize3'] + df['n_bid4'] * df['n_bsize4'] + 
+                       df['n_bid5'] * df['n_bsize5']) / (total_bid_size + 1e-10)
+        weighted_ask = (df['n_ask1'] * df['n_asize1'] + df['n_ask2'] * df['n_asize2'] + 
+                       df['n_ask3'] * df['n_asize3'] + df['n_ask4'] * df['n_asize4'] + 
+                       df['n_ask5'] * df['n_asize5']) / (total_ask_size + 1e-10)
+        feats['total_imbalance_weighted'] = (weighted_bid - weighted_ask) / (weighted_bid + weighted_ask + 1e-10)
         
-        X = self.create_features(df, window)
+        bid_price_diff = (df['n_bid1'] - df['n_bid5']) / (df['n_bid1'] + 1e-10)
+        ask_price_diff = (df['n_ask5'] - df['n_ask1']) / (df['n_ask1'] + 1e-10)
+        feats['bid_slope'] = bid_price_diff
+        feats['ask_slope'] = ask_price_diff
         
-        grouped = df.groupby(['sym', 'date'])
-        y_list = []
+        price_change_10 = grouped['n_midprice'].transform(lambda x: x.diff(10).fillna(0))
+        volume_sum_10 = grouped['amount_delta'].transform(lambda x: x.rolling(window=10, min_periods=1).sum())
+        feats['price_elasticity_10'] = price_change_10 / (volume_sum_10 + 1e-10)
+        
+        orderbook_pressure = (total_bid_size - total_ask_size) * (df['n_midprice'] - df['n_bid1']) / (df['n_ask1'] - df['n_bid1'] + 1e-10)
+        feats['orderbook_pressure'] = orderbook_pressure
+        
+        def calc_ofi_series(bid_p, bid_v, ask_p, ask_v):
+            prev_bid_p = bid_p.shift(1)
+            prev_bid_v = bid_v.shift(1)
+            prev_ask_p = ask_p.shift(1)
+            prev_ask_v = ask_v.shift(1)
+            
+            ofi_bid = np.where(bid_p > prev_bid_p, bid_v,
+                      np.where(bid_p == prev_bid_p, bid_v - prev_bid_v, -prev_bid_v))
+            ofi_ask = np.where(ask_p < prev_ask_p, ask_v,
+                      np.where(ask_p == prev_ask_p, ask_v - prev_ask_v, -prev_ask_v))
+            
+            return pd.Series(ofi_bid - ofi_ask, index=bid_p.index)
+        
+        ofi1_list = []
+        ofi2_list = []
+        ofi3_list = []
         for (sym, date), group in grouped:
-            y_list.extend(group[label_name].fillna(1).astype(int).values)
+            ofi1_list.append(calc_ofi_series(group['n_bid1'], group['n_bsize1'], group['n_ask1'], group['n_asize1']).fillna(0))
+            ofi2_list.append(calc_ofi_series(group['n_bid2'], group['n_bsize2'], group['n_ask2'], group['n_asize2']).fillna(0))
+            ofi3_list.append(calc_ofi_series(group['n_bid3'], group['n_bsize3'], group['n_ask3'], group['n_asize3']).fillna(0))
         
-        y = np.array(y_list)
+        feats['ofi_1'] = pd.concat(ofi1_list).reindex(df.index).fillna(0)
+        ofi2_series = pd.concat(ofi2_list).reindex(df.index).fillna(0)
+        ofi3_series = pd.concat(ofi3_list).reindex(df.index).fillna(0)
+        feats['ofi_avg_3'] = (feats['ofi_1'] + ofi2_series + ofi3_series) / 3
         
-        return xgb.DMatrix(X, label=y)
+        temp_ofi_df = pd.DataFrame({'sym': df['sym'], 'date': df['date'], 'ofi_1': feats['ofi_1']}, index=df.index)
+        temp_ofi_grouped = temp_ofi_df.groupby(['sym', 'date'])
+        feats['ofi_1_rolling_5'] = temp_ofi_grouped['ofi_1'].transform(lambda x: x.rolling(window=5, min_periods=1).sum()).fillna(0)
+        
+        spread_1 = df['spread_1'] if 'spread_1' in df.columns else (df['n_ask1'] - df['n_bid1'])
+        feats['ofi_spread_ratio'] = feats['ofi_1'] / (spread_1 + 1e-10)
+        
+        if 'midprice_delta' in df.columns:
+            feats['midprice_accel'] = grouped['midprice_delta'].diff().fillna(0)
+        else:
+            feats['midprice_accel'] = grouped['n_midprice'].transform(lambda x: x.diff().diff()).fillna(0)
+        
+        feats['energy_burst'] = df['amount_delta'] * feats['midprice_accel']
+        
+        imb_vel_list = []
+        imb_accel_list = []
+        for (sym, date), group in grouped:
+            group_imb = feats['total_imbalance'].loc[group.index]
+            group_vel = group_imb.diff().fillna(0)
+            group_accel = group_vel.diff().fillna(0)
+            imb_vel_list.append(group_vel)
+            imb_accel_list.append(group_accel)
+        
+        feats['imb_velocity'] = pd.concat(imb_vel_list).reindex(df.index).fillna(0)
+        feats['imb_accel'] = pd.concat(imb_accel_list).reindex(df.index).fillna(0)
+        
+        for lag in [1, 5, 20]:
+            feats[f'lag_mid_{lag}'] = grouped['n_midprice'].shift(lag).fillna(0)
+        
+        for lag in [1, 5]:
+            feats[f'lag_bid1_{lag}'] = grouped['n_bid1'].shift(lag).fillna(0)
+            feats[f'lag_ask1_{lag}'] = grouped['n_ask1'].shift(lag).fillna(0)
+            feats[f'lag_bsize1_{lag}'] = grouped['n_bsize1'].shift(lag).fillna(0)
+            feats[f'lag_asize1_{lag}'] = grouped['n_asize1'].shift(lag).fillna(0)
+        
+        amount_mean_100_val = grouped['amount_delta'].transform(lambda x: x.rolling(window=100, min_periods=1).mean()).fillna(1e-10)
+        for period in [5, 20, 60]:
+            amount_sum = grouped['amount_delta'].transform(lambda x: x.rolling(window=period, min_periods=1).sum()).fillna(0)
+            feats[f'volume_flow_{period}'] = amount_sum / (amount_mean_100_val + 1e-10)
+        
+        new_df = pd.concat([df, pd.DataFrame(feats, index=df.index)], axis=1)
+        
+        for col in self.base_feature_names:
+            if col in new_df.columns:
+                new_df[col] = new_df[col].replace([np.inf, -np.inf], 0).fillna(0)
+        
+        return new_df.copy()
     
-    def get_train_test_split(self, label_name='label_5', test_size=0.2, random_state=42, window=100, cache_dir='./cache', batch_size=50000):
+    def get_train_test_split(self, label_name='label_5', test_size=0.2, random_state=42, window=100, cache_dir='./cache', batch_size=5000):
         if label_name not in self.label_columns:
             raise ValueError(f"Label {label_name} not found. Available labels: {self.label_columns}")
         
@@ -315,74 +395,81 @@ class DataProcessor:
         val_files = csv_files[split_file_idx:]
         return train_files, val_files
 
-    def get_label_distribution(self, csv_files, label_name):
-        """
-        仅统计标签分布，用于计算类别权重，避免一次性加载全部特征
-        """
-        counts = {0: 0, 1: 0, 2: 0}
-        for labels in self._get_labels_only_generator(csv_files, label_name):
-            unique, cnts = np.unique(labels, return_counts=True)
-            for lbl, c in zip(unique, cnts):
-                counts[int(lbl)] = counts.get(int(lbl), 0) + int(c)
-        return counts
-
-    def _process_and_save_binary_blocks(self, csv_files, label_name, window, available_features, meta_path, cache_dir, batch_size=50000):
+    def _process_and_save_binary_blocks(self, csv_files, label_name, window, available_features, meta_path, cache_dir, batch_size=5000):
         batch_features = []
         batch_labels = []
+        batch_price_diffs = []
         label_counts = {0: 0, 1: 0, 2: 0}
         buffer_files = []
         buffer_idx = 0
         total_samples = 0
         
+        n_shift = int(label_name.split('_')[1])
         base_name = os.path.splitext(os.path.basename(meta_path))[0]
         
         def save_buffer():
-            nonlocal buffer_idx, batch_features, batch_labels, total_samples
+            nonlocal buffer_idx, batch_features, batch_labels, batch_price_diffs, total_samples
             if not batch_features:
                 return 0
-            X_batch = np.array(batch_features)
-            y_batch = np.array(batch_labels)
+            X_batch = np.array(batch_features, dtype=np.float32)
+            y_batch = np.array(batch_labels, dtype=np.int32)
+            p_batch = np.array(batch_price_diffs, dtype=np.float32)
+            
             buffer_file = os.path.join(cache_dir, f'{base_name}_{buffer_idx}.buffer')
+            price_file = buffer_file.replace('.buffer', '.price.npy')
+            
             dtrain_batch = xgb.DMatrix(X_batch, label=y_batch)
             dtrain_batch.save_binary(buffer_file)
+            np.save(price_file, p_batch)
+            
             num_samples = len(batch_labels)
             buffer_files.append(buffer_file)
             batch_features = []
             batch_labels = []
+            batch_price_diffs = []
             buffer_idx += 1
             return num_samples
         
+        import gc
+        
         for file in tqdm(csv_files, desc="Processing files", ncols=80):
-            df = pd.read_csv(file)
-            df = df.sort_values(['sym', 'date', 'time']).reset_index(drop=True)
-            df = self._add_derived_features(df)
-            
-            feature_df = df[available_features].copy()
-            for col in feature_df.columns:
-                feature_df[col] = feature_df[col].replace([np.inf, -np.inf], 0).fillna(0)
-            
-            grouped = df.groupby(['sym', 'date'])
-            for (sym, date), group in grouped:
-                group_features = feature_df.loc[group.index].values
-                group_labels = group[label_name].fillna(1).astype(int).values
+            try:
+                df = pd.read_csv(file)
+                df = df.sort_values(['sym', 'date', 'time']).reset_index(drop=True)
                 
-                for i in range(len(group)):
-                    if i < window - 1:
-                        hist_features = group_features[:i+1]
-                        padding = np.zeros((window - i - 1, len(available_features)))
-                        hist_features = np.vstack([padding, hist_features])
-                    else:
-                        hist_features = group_features[i-window+1:i+1]
+                df['price_diff_raw'] = df.groupby(['sym', 'date'])['n_midprice'].shift(-n_shift) - df['n_midprice']
+                
+                df = self._add_derived_features(df)
+                
+                feature_df = df[available_features].copy()
+                for col in feature_df.columns:
+                    feature_df[col] = feature_df[col].replace([np.inf, -np.inf], 0).fillna(0).astype(np.float32)
+                
+                mid_idx = available_features.index('n_midprice') if 'n_midprice' in available_features else 0
+                imb_idx = available_features.index('total_imbalance') if 'total_imbalance' in available_features else 0
+                
+                grouped = df.groupby(['sym', 'date'])
+                for (sym, date), group in grouped:
+                    group_features = feature_df.loc[group.index].values
+                    group_labels = group[label_name].fillna(1).astype(int).values
+                    group_diffs = group['price_diff_raw'].fillna(0).values
                     
-                    batch_features.append(hist_features.flatten())
-                    label = int(group_labels[i])
-                    batch_labels.append(label)
-                    label_counts[label] = label_counts.get(label, 0) + 1
-                    
-                    if len(batch_features) >= batch_size:
-                        total_samples += save_buffer()
-            
-            del df, feature_df
+                    for i in range(len(group)):
+                        pyramid_vec = self._assemble_pyramid_vector(group_features, i, mid_idx, imb_idx)
+                        batch_features.append(pyramid_vec)
+                        label = int(group_labels[i])
+                        batch_labels.append(label)
+                        batch_price_diffs.append(group_diffs[i])
+                        label_counts[label] = label_counts.get(label, 0) + 1
+                        
+                        if len(batch_features) >= batch_size:
+                            total_samples += save_buffer()
+                
+                del df, feature_df
+                gc.collect()
+            except Exception as e:
+                print(f"Error processing {file}: {e}")
+                continue
         
         total_samples += save_buffer()
         
@@ -397,144 +484,3 @@ class DataProcessor:
         
         return label_counts
     
-    def create_features_batch_generator(self, df, label_name, window=100, batch_size=10000):
-        """
-        分批生成特征和标签，避免内存溢出
-        """
-        df = df.sort_values(['sym', 'date', 'time']).reset_index(drop=True)
-        df = self._add_derived_features(df)
-        available_features = [col for col in self.feature_columns if col in df.columns]
-        feature_df = df[available_features].copy()
-        
-        for col in feature_df.columns:
-            feature_df[col] = feature_df[col].replace([np.inf, -np.inf], 0).fillna(0)
-        
-        grouped = df.groupby(['sym', 'date'])
-        batch_features = []
-        batch_labels = []
-        
-        for (sym, date), group in grouped:
-            group_features = feature_df.loc[group.index].values
-            group_labels = group[label_name].fillna(1).astype(int).values
-            
-            for i in range(len(group)):
-                if i < window - 1:
-                    hist_features = group_features[:i+1]
-                    padding = np.zeros((window - i - 1, len(available_features)))
-                    hist_features = np.vstack([padding, hist_features])
-                else:
-                    hist_features = group_features[i-window+1:i+1]
-                
-                batch_features.append(hist_features.flatten())
-                batch_labels.append(group_labels[i])
-                
-                if len(batch_features) >= batch_size:
-                    yield np.array(batch_features), np.array(batch_labels)
-                    batch_features = []
-                    batch_labels = []
-        
-        if batch_features:
-            yield np.array(batch_features), np.array(batch_labels)
-    
-    def get_train_test_split_batch(self, label_name='label_5', test_size=0.2, window=100, batch_size=10000):
-        """
-        分批版本：返回生成器而不是完整的DMatrix，避免一次性加载所有数据
-        """
-        if label_name not in self.label_columns:
-            raise ValueError(f"Label {label_name} not found. Available labels: {self.label_columns}")
-        
-        train_files, val_files = self._split_files(test_size)
-        
-        # 创建生成器，分批加载文件
-        train_gen = self._load_and_process_files_generator(train_files, label_name, window, batch_size)
-        val_gen = self._load_and_process_files_generator(val_files, label_name, window, batch_size)
-        
-        return train_gen, val_gen
-    
-    def _get_labels_only_generator(self, csv_files, label_name):
-        """
-        轻量级生成器：只读取标签，不创建特征，用于计算类别权重
-        """
-        for file in csv_files:
-            df = pd.read_csv(file)
-            grouped = df.groupby(['sym', 'date'])
-            for (sym, date), group in grouped:
-                labels = group[label_name].fillna(1).astype(int).values
-                yield labels
-            del df
-    
-    def _load_and_process_files_generator(self, csv_files, label_name, window, batch_size):
-        """
-        分批加载文件并生成特征，避免一次性加载所有数据
-        """
-        if not csv_files:
-            return
-        
-        available_features = [col for col in self.feature_columns if col in pd.read_csv(csv_files[0], nrows=1).columns]
-        batch_features = []
-        batch_labels = []
-        
-        for file in tqdm(csv_files, desc="Processing files", leave=False, ncols=80):
-            df = pd.read_csv(file)
-            df = df.sort_values(['sym', 'date', 'time']).reset_index(drop=True)
-            df = self._add_derived_features(df)
-            
-            feature_df = df[available_features].copy()
-            for col in feature_df.columns:
-                feature_df[col] = feature_df[col].replace([np.inf, -np.inf], 0).fillna(0)
-            
-            grouped = df.groupby(['sym', 'date'])
-            
-            for (sym, date), group in grouped:
-                group_features = feature_df.loc[group.index].values
-                group_labels = group[label_name].fillna(1).astype(int).values
-                
-                for i in range(len(group)):
-                    if i < window - 1:
-                        hist_features = group_features[:i+1]
-                        padding = np.zeros((window - i - 1, len(available_features)))
-                        hist_features = np.vstack([padding, hist_features])
-                    else:
-                        hist_features = group_features[i-window+1:i+1]
-                    
-                    batch_features.append(hist_features.flatten())
-                    batch_labels.append(group_labels[i])
-                    
-                    if len(batch_features) >= batch_size:
-                        yield np.array(batch_features), np.array(batch_labels)
-                        batch_features = []
-                        batch_labels = []
-            
-            del df, feature_df
-        
-        if batch_features:
-            yield np.array(batch_features), np.array(batch_labels)
-
-
-def main():
-    import argparse
-    
-    parser = argparse.ArgumentParser(description='Test data processing module')
-    parser.add_argument('--data_dir', type=str, required=True, help='Directory containing CSV files')
-    parser.add_argument('--label', type=str, default='label_5', help='Label name to use')
-    
-    args = parser.parse_args()
-    
-    processor = DataProcessor(args.data_dir)
-    
-    print(f"Processing data from: {args.data_dir}")
-    print(f"Using label: {args.label}")
-    
-    dtrain = processor.process_data(args.label)
-    print(f"Total data shape: {dtrain.num_row()} samples, {dtrain.num_col()} features")
-    
-    dtrain_split, dtest_split = processor.get_train_test_split(args.label)
-    print(f"Train set: {dtrain_split.num_row()} samples")
-    print(f"Test set: {dtest_split.num_row()} samples")
-    
-    print("Data processing test completed successfully!")
-
-
-if __name__ == '__main__':
-    main()
-

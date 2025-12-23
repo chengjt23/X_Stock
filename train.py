@@ -1,6 +1,8 @@
 import argparse
 import os
 import sys
+import glob
+import re
 from datetime import datetime
 
 sys.path.append(os.path.dirname(os.path.abspath(__file__)))
@@ -14,18 +16,20 @@ def tprint(*args, **kwargs):
     print(f'[{timestamp}]', *args, **kwargs)
 
 
-def train_model(data_dir, label_name, model_save_dir, window=100, test_size=0.2, random_state=42, cache_dir='./cache', batch_size=5000, use_cache=False):
+# 1. 修改函数签名，增加 resume 参数
+def train_model(data_dir, label_name, model_save_dir, window=100, test_size=0.2, random_state=42, cache_dir='./cache', batch_size=5000, use_cache=False, resume=False):
     import numpy as np
     import xgboost as xgb
     import gc
     
-    num_boost_round = 500
+    num_boost_round = 2000
     
     tprint(f"Training model for {label_name}")
     tprint(f"Data directory: {data_dir}")
     tprint(f"Window size: {window}")
     tprint(f"Batch size: {batch_size}")
     tprint(f"Use cache: {use_cache}")
+    tprint(f"Resume training: {resume}") # 打印是否续训
     
     train_meta = os.path.join(cache_dir, f'train_{label_name}.meta')
     val_meta = os.path.join(cache_dir, f'val_{label_name}.meta')
@@ -141,47 +145,16 @@ def train_model(data_dir, label_name, model_save_dir, window=100, test_size=0.2,
     tprint(f"Train samples: {dtrain.num_row()}, Features: {dtrain.num_col()}")
     tprint(f"Validation samples: {dval.num_row()}")
     
-    num_features = dtrain.num_col()
-    processor_temp = DataProcessor(data_dir)
-    num_base_features = len([col for col in processor_temp.feature_columns])
-    tprint(f"\nFeature dimension details:")
-    tprint(f"  Base features: {num_base_features}")
-    tprint(f"  Window size: {window}")
-    tprint(f"  Total features per sample: {num_base_features} × {window} = {num_features}")
-    
-    tprint("\n=== Diagnosing Features ===")
-    with open(train_meta, 'r') as f:
-        first_buffer = f.readline().strip()
-    
-    if os.path.exists(first_buffer):
-        dm_test = xgb.DMatrix(first_buffer)
-        X_test = dm_test.get_data()
-        
-        if hasattr(X_test, 'toarray'):
-            X_dense = X_test.toarray()[:100]
-        else:
-            X_dense = X_test[:100]
-        
-        tprint(f"Sample shape (first 100): {X_dense.shape}")
-        tprint(f"Max value: {np.max(X_dense):.6f}, Min value: {np.min(X_dense):.6f}")
-        tprint(f"Mean: {np.mean(X_dense):.6f}, Std: {np.std(X_dense):.6f}")
-        tprint(f"Percentage of zeros: {100 * np.sum(X_dense == 0) / X_dense.size:.2f}%")
-        tprint(f"Number of NaN: {np.sum(np.isnan(X_dense))}")
-        tprint(f"Number of inf: {np.sum(np.isinf(X_dense))}")
-        
-        non_zero_cols = np.sum(X_dense != 0, axis=0) > 0
-        tprint(f"Non-zero columns: {np.sum(non_zero_cols)}/{X_dense.shape[1]}")
-        tprint("===========================\n")
-    
     params = {
         'objective': 'multi:softprob',
         'num_class': 3,
         'eval_metric': 'mlogloss',
-        'max_depth': 6,
-        'learning_rate': 0.2,
+        'max_depth': 8,
+        'learning_rate': 0.1,
         'subsample': 0.7,
-        'colsample_bytree': 0.7,
-        'reg_alpha': 0.1,
+        'colsample_bytree': 0.5,
+        'min_child_weight': 20,
+        'reg_alpha': 2.0,
         'reg_lambda': 1.0,
         'random_state': random_state,
         'nthread': -1,
@@ -194,14 +167,60 @@ def train_model(data_dir, label_name, model_save_dir, window=100, test_size=0.2,
     for key, value in params.items():
         tprint(f"  {key}: {value}")
     
-    tprint("Training model with external memory (each tree covers all data)...")
+    # ==========================================
+    # 🚀 Checkpoint 与 续训逻辑 (核心修改)
+    # ==========================================
+    
+    checkpoint_dir = os.path.join(model_save_dir, 'checkpoints')
+    os.makedirs(checkpoint_dir, exist_ok=True)
+    
+    xgb_model_path = None
+    
+    # 2. 如果开启了 resume，则搜索 Checkpoint
+    if resume:
+        ckpt_pattern = os.path.join(checkpoint_dir, f"ckpt_{label_name}_*.json")
+        existing_ckpts = glob.glob(ckpt_pattern)
+        
+        if existing_ckpts:
+            latest_ckpt = None
+            max_iter = -1
+            
+            for f in existing_ckpts:
+                # 匹配文件名中的迭代数
+                match = re.search(rf"ckpt_{label_name}_(\d+)\.json", f)
+                if match:
+                    iteration = int(match.group(1))
+                    if iteration > max_iter:
+                        max_iter = iteration
+                        latest_ckpt = f
+            
+            if latest_ckpt:
+                tprint(f"🔄 Found checkpoint! Resuming training from: {latest_ckpt} (Iteration {max_iter})")
+                xgb_model_path = latest_ckpt
+            else:
+                tprint("⚠️ No valid checkpoint found matching pattern. Starting fresh training...")
+        else:
+            tprint("⚠️ No checkpoints found in directory. Starting fresh training...")
+    else:
+        tprint("🚀 Starting FRESH training (ignoring any existing checkpoints)...")
+
+    # 3. 配置每250轮保存一次的回调
+    ckpt_callback = xgb.callback.TrainingCheckPoint(
+        directory=checkpoint_dir,
+        name=f"ckpt_{label_name}",
+        iterations=250 # 每隔250个 tree 存一次
+    )
+
+    tprint("Training model with external memory...")
     xgb_model = xgb.train(
         params,
         dtrain,
         num_boost_round=num_boost_round,
         evals=[(dval, 'eval')] if dval else None,
-        early_stopping_rounds=10,
-        verbose_eval=10
+        early_stopping_rounds=100,
+        verbose_eval=10,
+        xgb_model=xgb_model_path,   # 传入断点路径（如果不需要续训则为 None）
+        callbacks=[ckpt_callback]   # 传入自动保存回调
     )
     
     model = XGBoostModel(**params)
@@ -210,22 +229,41 @@ def train_model(data_dir, label_name, model_save_dir, window=100, test_size=0.2,
     os.makedirs(model_save_dir, exist_ok=True)
     model_path = os.path.join(model_save_dir, f"model_{label_name}.pth")
     model.save_model(model_path)
-    tprint(f"Model saved to: {model_path}")
+    tprint(f"Final Model saved to: {model_path}")
     
-    tprint("Evaluating on validation set...")
-    pred_proba = model.predict_proba(dval)
-    pred = pred_proba.argmax(axis=1)
+    tprint("Evaluating on validation set with Confidence Filter...")
+    pred_proba = xgb_model.predict(dval)
     
-    from sklearn.metrics import accuracy_score, classification_report
-    
+    standard_pred = pred_proba.argmax(axis=1)
     val_labels = dval.get_label().astype(int)
-    accuracy = accuracy_score(val_labels, pred)
-    tprint(f"Validation Accuracy: {accuracy:.4f}")
-    tprint("\nClassification Report:")
-    report = classification_report(val_labels, pred, target_names=['Down', 'Unchanged', 'Up'])
-    for line in report.split('\n'):
-        if line.strip():
-            tprint(line)
+
+    thresholds = [0.0, 0.40, 0.45, 0.50, 0.60, 0.70, 0.80, 0.90]
+    tprint(f"{'Threshold':<10} | {'Signals %':<12} | {'Precision (Up/Down)':<20} | {'Recall (Up/Down)':<15}")
+    tprint("-" * 65)
+
+    for thr in thresholds:
+        mask_down = pred_proba[:, 0] > thr
+        mask_up = pred_proba[:, 2] > thr
+        
+        total_signals = np.sum(mask_down) + np.sum(mask_up)
+        signal_pct = 100 * total_signals / len(val_labels)
+        
+        if total_signals > 0:
+            correct_down = np.sum((val_labels[mask_down] == 0))
+            correct_up = np.sum((val_labels[mask_up] == 2))
+            
+            precision = (correct_down + correct_up) / total_signals
+            
+            actual_moves = np.sum((val_labels == 0) | (val_labels == 2))
+            recall = (correct_down + correct_up) / actual_moves
+            
+            tprint(f"{thr:<10.2f} | {signal_pct:<12.2f}% | {precision:<20.4f} | {recall:<15.4f}")
+        else:
+            tprint(f"{thr:<10.2f} | 0.00%         | N/A                  | 0.0000")
+
+    from sklearn.metrics import classification_report
+    tprint("\nFull Classification Report (Standard Argmax):")
+    print(classification_report(val_labels, standard_pred, target_names=['Down', 'Unchanged', 'Up']))
     
     return model
 
@@ -234,15 +272,18 @@ def main():
     parser = argparse.ArgumentParser(description='Train XGBoost models for stock price direction prediction')
     parser.add_argument('--data_dir', type=str, required=True, help='Directory containing CSV files')
     parser.add_argument('--model_save_dir', type=str, default='./Experiments', help='Directory to save trained models')
-    parser.add_argument('--cache_dir', type=str, default='./cache', help='Directory for binary DMatrix cache files')
+    parser.add_argument('--cache_dir', type=str, default='/mnt/data/cache', help='Directory for binary DMatrix cache files')
     parser.add_argument('--label', type=str, default='all', 
-                       choices=['label_5', 'label_10', 'label_20', 'label_40', 'label_60', 'all'],
-                       help='Label to train (default: all)')
+                        choices=['label_5', 'label_10', 'label_20', 'label_40', 'label_60', 'all'],
+                        help='Label to train (default: all)')
     parser.add_argument('--window', type=int, default=100, help='Window size for historical features')
     parser.add_argument('--test_size', type=float, default=0.2, help='Test set size ratio')
     parser.add_argument('--random_state', type=int, default=42, help='Random state for reproducibility')
     parser.add_argument('--batch_size', type=int, default=5000, help='Batch size for processing data blocks')
     parser.add_argument('--use_cache', action='store_true', default=False, help='Use existing cache files instead of processing data')
+    
+    # 4. 在 main 函数增加 --resume 参数
+    parser.add_argument('--resume', action='store_true', help='Resume training from the latest checkpoint if available')
     
     args = parser.parse_args()
     
@@ -259,7 +300,8 @@ def main():
             random_state=args.random_state,
             cache_dir=args.cache_dir,
             batch_size=args.batch_size,
-            use_cache=args.use_cache
+            use_cache=args.use_cache,
+            resume=args.resume  # 传入参数
         )
         tprint(f"{'='*60}\n")
     
@@ -268,4 +310,3 @@ def main():
 
 if __name__ == '__main__':
     main()
-
