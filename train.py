@@ -88,9 +88,10 @@ def train_model(data_dir, label_name, model_save_dir, window=100, test_size=0.2,
     tprint(f"Using external memory training with {len(buffer_files)} train buffers and {len(val_buffer_files)} val buffers")
     
     class DMatrixIterator(xgb.DataIter):
-        def __init__(self, buffer_files, class_weights=None, desc="Loading", cache_prefix=None):
+        def __init__(self, buffer_files, class_weights=None, desc="Loading", cache_prefix=None, use_profit_weight=True):
             self.buffer_files = buffer_files
             self.class_weights = class_weights
+            self.use_profit_weight = use_profit_weight
             self.current_idx = 0
             self.desc = desc
             self.pbar = None
@@ -105,17 +106,34 @@ def train_model(data_dir, label_name, model_save_dir, window=100, test_size=0.2,
                 return 0
             if self.pbar is None:
                 self.pbar = tqdm(total=len(self.buffer_files), desc=self.desc, ncols=80)
-            dm = xgb.DMatrix(self.buffer_files[self.current_idx])
+            
+            buffer_file = self.buffer_files[self.current_idx]
+            dm = xgb.DMatrix(buffer_file)
             X = dm.get_data()
             y = dm.get_label()
-            if self.class_weights:
-                w = np.array([self.class_weights.get(int(label), 1.0) for label in y])
-                input_data(data=X, label=y, weight=w)
-                del w
-            else:
-                input_data(data=X, label=y)
             
-            del dm, X, y
+            w = np.ones_like(y, dtype=np.float32)
+            
+            if self.use_profit_weight:
+                price_file = buffer_file.replace('.buffer', '.price.npy')
+                if os.path.exists(price_file):
+                    price_diffs = np.load(price_file)
+                    abs_diffs = np.abs(price_diffs)
+                    mean_diff = np.mean(abs_diffs) + 1e-10
+                    
+                    profit_w = 0.5 + 1.5 * (abs_diffs / mean_diff)
+                    w = w * profit_w
+            
+            if self.class_weights:
+                cw = np.array([self.class_weights.get(int(label), 1.0) for label in y])
+                w = w * cw
+            
+            if self.use_profit_weight:
+                w = np.clip(w, 0.1, 10.0)
+            
+            input_data(data=X, label=y, weight=w)
+            
+            del dm, X, y, w
             gc.collect()
             
             self.current_idx += 1
@@ -128,19 +146,19 @@ def train_model(data_dir, label_name, model_save_dir, window=100, test_size=0.2,
                 self.pbar.close()
                 self.pbar = None
     
-    tprint("Creating ExtMemQuantileDMatrix for true external memory training...")
+    tprint("Creating ExtMemQuantileDMatrix with Profit Weighting (train only)...")
     train_cache = os.path.join(cache_dir, f"extmem_train_{label_name}")
     val_cache = os.path.join(cache_dir, f"extmem_val_{label_name}")
     
-    train_iter = DMatrixIterator(buffer_files, class_weights, desc="Loading train data", cache_prefix=train_cache)
+    train_iter = DMatrixIterator(buffer_files, class_weights, desc="Loading train data", cache_prefix=train_cache, use_profit_weight=False)
     dtrain = xgb.ExtMemQuantileDMatrix(train_iter, max_bin=256)
     gc.collect()
     tprint("Training data loaded, memory cleaned")
     
-    val_iter = DMatrixIterator(val_buffer_files, desc="Loading val data", cache_prefix=val_cache)
+    val_iter = DMatrixIterator(val_buffer_files, class_weights, desc="Loading val data", cache_prefix=val_cache, use_profit_weight=False)
     dval = xgb.ExtMemQuantileDMatrix(val_iter, max_bin=256, ref=dtrain)
     gc.collect()
-    tprint("Validation data loaded, memory cleaned")
+    tprint("Validation data loaded, memory cleaned (no profit weighting for unbiased evaluation)")
     
     tprint(f"Train samples: {dtrain.num_row()}, Features: {dtrain.num_col()}")
     tprint(f"Validation samples: {dval.num_row()}")
@@ -149,13 +167,14 @@ def train_model(data_dir, label_name, model_save_dir, window=100, test_size=0.2,
         'objective': 'multi:softprob',
         'num_class': 3,
         'eval_metric': 'mlogloss',
-        'max_depth': 8,
-        'learning_rate': 0.1,
+        'max_depth': 7,
+        'learning_rate': 0.05,
         'subsample': 0.7,
-        'colsample_bytree': 0.5,
-        'min_child_weight': 20,
-        'reg_alpha': 2.0,
-        'reg_lambda': 1.0,
+        'colsample_bytree': 0.4,
+        'min_child_weight': 50,
+        'reg_alpha': 5.0,
+        'reg_lambda': 2.0,
+        'gamma': 0.5,
         'random_state': random_state,
         'nthread': -1,
         'tree_method': 'hist'

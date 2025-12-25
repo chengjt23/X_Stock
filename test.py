@@ -20,15 +20,30 @@ def evaluate_model(model_path, meta_path, data_dir, eval_threshold=0.88):
     tprint(f"Model: {model_path}")
     tprint(f"Final Report Threshold: {eval_threshold}")
 
-    # 1. 加载模型
+    # ==========================================
+    # 🚀 1. 智能模型加载 (核心修改)
+    # ==========================================
     try:
-        loaded_obj = joblib.load(model_path)
-        bst = loaded_obj.model if hasattr(loaded_obj, 'model') else loaded_obj
+        # 判断后缀是否为 XGBoost 原生格式
+        if model_path.endswith('.ubj') or model_path.endswith('.json') or model_path.endswith('.model'):
+            tprint("Detected XGBoost native model format. Loading via xgb.Booster...")
+            bst = xgb.Booster()
+            bst.load_model(model_path)
+        else:
+            # 默认为 joblib 格式 (.pth/.pkl)
+            tprint("Loading via joblib (.pth)...")
+            loaded_obj = joblib.load(model_path)
+            # 兼容 XGBoostModel 包装类或直接的 Booster 对象
+            bst = loaded_obj.model if hasattr(loaded_obj, 'model') else loaded_obj
+            
         tprint("Model loaded successfully.")
     except Exception as e:
-        tprint(f"Error loading model: {e}"); return
+        tprint(f"Error loading model: {e}")
+        return
 
+    # ==========================================
     # 2. 加载数据与同步的价格差文件
+    # ==========================================
     if not os.path.exists(meta_path):
         tprint(f"Error: Meta file {meta_path} not found."); return
         
@@ -39,18 +54,35 @@ def evaluate_model(model_path, meta_path, data_dir, eval_threshold=0.88):
     
     xs, ys, price_deltas = [], [], []
     for bf in buffer_files:
-        dm = xgb.DMatrix(bf)
-        xs.append(dm.get_data())
-        ys.append(dm.get_label())
-        
-        # 加载 DataProcessor 生成的 .price.npy 文件
-        pf = bf.replace('.buffer', '.price.npy')
-        if os.path.exists(pf):
-            price_deltas.append(np.load(pf))
-        else:
-            tprint(f"Warning: Price file {pf} missing! Using zeros.")
-            price_deltas.append(np.zeros(int(dm.num_row())))
+        try:
+            # XGBoost 会自动识别 .buffer 或 .ubj
+            dm = xgb.DMatrix(bf)
+            xs.append(dm.get_data())
+            ys.append(dm.get_label())
+            
+            # 🚀 兼容性修复：无论后缀是 .buffer 还是 .ubj，都能找到 .price.npy
+            base_name, _ = os.path.splitext(bf)
+            pf = base_name + '.price.npy'
+            
+            if os.path.exists(pf):
+                price_deltas.append(np.load(pf))
+            else:
+                # 再次尝试旧逻辑作为兜底
+                pf_fallback = bf.replace('.buffer', '.price.npy')
+                if os.path.exists(pf_fallback):
+                    price_deltas.append(np.load(pf_fallback))
+                else:
+                    tprint(f"Warning: Price file {pf} missing! Using zeros.")
+                    price_deltas.append(np.zeros(int(dm.num_row())))
+                    
+        except Exception as e:
+            tprint(f"Error processing block {bf}: {e}")
+            continue
     
+    if not xs:
+        tprint("No valid data loaded.")
+        return
+
     X_all = sp.vstack(xs) if sp.issparse(xs[0]) else np.vstack(xs)
     y_true = np.concatenate(ys).astype(int)
     p_diff_raw = np.concatenate(price_deltas) # P(t+n) - P(t)
@@ -68,7 +100,7 @@ def evaluate_model(model_path, meta_path, data_dir, eval_threshold=0.88):
 
     actual_moves_mask = (y_true == 0) | (y_true == 2)
     total_actual_moves = np.sum(actual_moves_mask)
-    thresholds = [0.0, 0.35, 0.40, 0.50, 0.60,0.65, 0.70, 0.75, 0.80,0.81, 0.82, 0.83,0.84, 0.85, 0.88,0.90, 0.95]
+    thresholds = [0.0, 0.35, 0.40, 0.50, 0.60, 0.65, 0.70, 0.75, 0.80, 0.81, 0.82, 0.83, 0.84, 0.85, 0.88, 0.90, 0.95]
     
     for thr in thresholds:
         mask_down = pred_proba[:, 0] > thr
@@ -94,8 +126,6 @@ def evaluate_model(model_path, meta_path, data_dir, eval_threshold=0.88):
             recall = correct / (total_actual_moves + 1e-10)
             
             # --- 收益率计算逻辑 ---
-            # 预测上涨(2): 收益 = P(t+n) - P(t) [即 diffs_in_mask]
-            # 预测下跌(0): 收益 = P(t) - P(t+n) [即 -diffs_in_mask]
             trade_pnls = np.where(preds_in_mask == 2, diffs_in_mask, -diffs_in_mask)
             total_pnl = np.sum(trade_pnls)
             avg_pnl = total_pnl / num_signals
