@@ -160,8 +160,8 @@ def train_model(data_dir, label_name, model_save_dir, window=100, test_size=0.2,
     gc.collect()
     tprint("Validation data loaded, memory cleaned (no profit weighting for unbiased evaluation)")
     
-    tprint(f"Train samples: {dtrain.num_row()}, Features: {dtrain.num_col()}")
-    tprint(f"Validation samples: {dval.num_row()}")
+    tprint(f"Train samples: {dtrain.num_row()}, Final features (with time lags): {dtrain.num_col()}")
+    tprint(f"Validation samples: {dval.num_row()}, Final features (with time lags): {dval.num_col()}")
     
     params = {
         'objective': 'multi:softprob',
@@ -256,7 +256,7 @@ def train_model(data_dir, label_name, model_save_dir, window=100, test_size=0.2,
     standard_pred = pred_proba.argmax(axis=1)
     val_labels = dval.get_label().astype(int)
 
-    thresholds = [0.0, 0.40, 0.45, 0.50, 0.60, 0.70, 0.80, 0.90]
+    thresholds = [0.0, 0.40, 0.45, 0.50, 0.60, 0.70, 0.80, 0.84, 0.90]
     tprint(f"{'Threshold':<10} | {'Signals %':<12} | {'Precision (Up/Down)':<20} | {'Recall (Up/Down)':<15}")
     tprint("-" * 65)
 

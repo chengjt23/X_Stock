@@ -64,7 +64,11 @@ class DataProcessor:
             'bid_slope', 'ask_slope',
             'price_elasticity_10', 'orderbook_pressure',
             'ofi_1', 'ofi_avg_3', 'ofi_1_rolling_5', 'ofi_spread_ratio',
-            'midprice_accel', 'imb_velocity', 'imb_accel', 'energy_burst'
+            'midprice_accel', 'imb_velocity', 'imb_accel', 'energy_burst',
+            'micro_price', 'micro_price_diff', 'weighted_depth_imbalance',
+            'ofi_momentum_sync', 'vov_10', 'bid_convexity', 'ask_convexity',
+            'buy_intensity', 'sell_intensity', 'ofi_ema_5', 'ofi_ema_10',
+            'vpin_5', 'vpin_20', 'book_curvature', 'depth_pressure'
         ]
         self.raw_snapshot_cols = [
             'n_midprice', 'n_bid1', 'n_ask1', 'n_bsize1', 'n_asize1',
@@ -80,7 +84,7 @@ class DataProcessor:
     
     def _generate_final_names(self):
         names = []
-        for lag in [0, 1, 2]:
+        for lag in [0, 1, 2, 3, 4]:
             names += [f"{c}_t{lag}" for c in self.base_feature_names]
         for lag in [5, 10, 20, 40, 80, 100]:
             names += [f"mid_lag{lag}", f"imb_lag{lag}"]
@@ -88,7 +92,7 @@ class DataProcessor:
     
     def _assemble_pyramid_vector(self, f_matrix, i, mid_idx, imb_idx):
         full_frames = []
-        for lag in [0, 1, 2]:
+        for lag in [0, 1, 2, 3, 4]:
             idx = max(0, i - lag)
             full_frames.append(f_matrix[idx])
         
@@ -329,6 +333,53 @@ class DataProcessor:
             amount_sum = grouped['amount_delta'].transform(lambda x: x.rolling(window=period, min_periods=1).sum()).fillna(0)
             feats[f'volume_flow_{period}'] = amount_sum / (amount_mean_100_val + 1e-10)
         
+        feats['micro_price'] = (df['n_bid1'] * df['n_asize1'] + df['n_ask1'] * df['n_bsize1']) / (df['n_bsize1'] + df['n_asize1'] + 1e-10)
+        micro_price_series = pd.Series(feats['micro_price'], index=df.index)
+        micro_price_df = pd.DataFrame({'sym': df['sym'], 'date': df['date'], 'micro_price': micro_price_series}, index=df.index)
+        micro_price_grouped = micro_price_df.groupby(['sym', 'date'])
+        feats['micro_price_diff'] = micro_price_grouped['micro_price'].transform(lambda x: x.diff()).fillna(0)
+        
+        w = np.array([1.0, 0.8, 0.6, 0.4, 0.2])
+        bid_depth = (df['n_bsize1']*w[0] + df['n_bsize2']*w[1] + df['n_bsize3']*w[2] + df['n_bsize4']*w[3] + df['n_bsize5']*w[4])
+        ask_depth = (df['n_asize1']*w[0] + df['n_asize2']*w[1] + df['n_asize3']*w[2] + df['n_asize4']*w[3] + df['n_asize5']*w[4])
+        feats['weighted_depth_imbalance'] = (bid_depth - ask_depth) / (bid_depth + ask_depth + 1e-10)
+        
+        ofi_1_val = feats['ofi_1'] if 'ofi_1' in feats else (df['ofi_1'] if 'ofi_1' in df.columns else pd.Series(0, index=df.index))
+        mid_diff_val = df['midprice_delta'] if 'midprice_delta' in df.columns else grouped['n_midprice'].transform(lambda x: x.diff()).fillna(0)
+        feats['ofi_momentum_sync'] = ofi_1_val * mid_diff_val
+        
+        if 'volatility_10' in df.columns:
+            feats['vov_10'] = grouped['volatility_10'].transform(lambda x: x.rolling(window=5, min_periods=1).std()).fillna(0)
+        else:
+            temp_mid = 2 + df['n_ask1'] + df['n_bid1']
+            temp_mid_df = pd.DataFrame({'sym': df['sym'], 'date': df['date'], 'temp_mid': temp_mid}, index=df.index)
+            vol10 = temp_mid_df.groupby(['sym', 'date'])['temp_mid'].transform(lambda x: (x / (x.shift(10) + 1e-10) - 1).fillna(0))
+            vol10_df = pd.DataFrame({'sym': df['sym'], 'date': df['date'], 'vol10': vol10}, index=df.index)
+            feats['vov_10'] = vol10_df.groupby(['sym', 'date'])['vol10'].transform(lambda x: x.rolling(window=5, min_periods=1).std()).fillna(0)
+        
+        feats['bid_convexity'] = (df['n_bsize1'] + df['n_bsize5'] - 2 * df['n_bsize3']) / (df['n_bsize3'] + 1e-10)
+        feats['ask_convexity'] = (df['n_asize1'] + df['n_asize5'] - 2 * df['n_asize3']) / (df['n_asize3'] + 1e-10)
+        
+        feats['buy_intensity'] = df['amount_delta'] / (df['n_asize1'] + 1e-10)
+        feats['sell_intensity'] = df['amount_delta'] / (df['n_bsize1'] + 1e-10)
+        
+        ofi_1_for_ema = feats['ofi_1'] if 'ofi_1' in feats else (df['ofi_1'] if 'ofi_1' in df.columns else pd.Series(0, index=df.index))
+        ofi_ema_df = pd.DataFrame({'sym': df['sym'], 'date': df['date'], 'ofi_1': ofi_1_for_ema}, index=df.index)
+        ofi_ema_grouped = ofi_ema_df.groupby(['sym', 'date'])
+        feats['ofi_ema_5'] = ofi_ema_grouped['ofi_1'].transform(lambda x: x.ewm(span=5, adjust=False).mean()).fillna(0)
+        feats['ofi_ema_10'] = ofi_ema_grouped['ofi_1'].transform(lambda x: x.ewm(span=10, adjust=False).mean()).fillna(0)
+        
+        amount_abs = df['amount_delta'].abs()
+        amount_df = pd.DataFrame({'sym': df['sym'], 'date': df['date'], 'amount_abs': amount_abs}, index=df.index)
+        amount_grouped = amount_df.groupby(['sym', 'date'])
+        for period in [5, 20]:
+            amount_vol = amount_grouped['amount_abs'].transform(lambda x: x.rolling(window=period, min_periods=1).std()).fillna(1e-10)
+            amount_mean = amount_grouped['amount_abs'].transform(lambda x: x.rolling(window=period, min_periods=1).mean()).fillna(1e-10)
+            feats[f'vpin_{period}'] = amount_vol / (amount_mean + 1e-10)
+        
+        feats['book_curvature'] = (feats['bid_convexity'] + feats['ask_convexity']) / 2
+        feats['depth_pressure'] = (bid_depth + ask_depth) * feats['weighted_depth_imbalance']
+        
         new_df = pd.concat([df, pd.DataFrame(feats, index=df.index)], axis=1)
         
         for col in self.base_feature_names:
@@ -353,8 +404,9 @@ class DataProcessor:
         available_features = [col for col in self.feature_columns if col in sample_df.columns]
         
         print(f"\n=== Feature Availability Check ===")
-        print(f"Total defined features: {len(self.feature_columns)}")
-        print(f"Available features after derivation: {len(available_features)}")
+        print(f"Base features defined: {len(self.feature_columns)}")
+        print(f"Final features (with time lags): {len(self.final_feature_names)}")
+        print(f"Available base features after derivation: {len(available_features)}")
         if len(available_features) < len(self.feature_columns):
             missing_features = set(self.feature_columns) - set(available_features)
             print(f"Missing features ({len(missing_features)}): {list(missing_features)[:10]}")

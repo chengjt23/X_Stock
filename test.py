@@ -42,7 +42,7 @@ def evaluate_model(model_path, meta_path, data_dir, eval_threshold=0.88):
         return
 
     # ==========================================
-    # 2. 加载数据与同步的价格差文件
+    # 2. 流式加载数据并分批预测（内存优化）
     # ==========================================
     if not os.path.exists(meta_path):
         tprint(f"Error: Meta file {meta_path} not found."); return
@@ -50,48 +50,51 @@ def evaluate_model(model_path, meta_path, data_dir, eval_threshold=0.88):
     with open(meta_path, 'r') as f:
         buffer_files = [line.strip() for line in f if line.strip()]
     
-    tprint(f"Loading {len(buffer_files)} blocks and fetching real price deltas...")
+    tprint(f"Processing {len(buffer_files)} blocks in streaming mode...")
     
-    xs, ys, price_deltas = [], [], []
-    for bf in buffer_files:
+    pred_proba_list = []
+    y_true_list = []
+    p_diff_raw_list = []
+    
+    for idx, bf in enumerate(buffer_files):
         try:
-            # XGBoost 会自动识别 .buffer 或 .ubj
-            dm = xgb.DMatrix(bf)
-            xs.append(dm.get_data())
-            ys.append(dm.get_label())
+            if (idx + 1) % 10 == 0:
+                tprint(f"Processing block {idx + 1}/{len(buffer_files)}...")
             
-            # 🚀 兼容性修复：无论后缀是 .buffer 还是 .ubj，都能找到 .price.npy
+            dm = xgb.DMatrix(bf)
+            y_block = dm.get_label().astype(int)
+            
             base_name, _ = os.path.splitext(bf)
             pf = base_name + '.price.npy'
             
             if os.path.exists(pf):
-                price_deltas.append(np.load(pf))
+                p_diff_block = np.load(pf)
             else:
-                # 再次尝试旧逻辑作为兜底
                 pf_fallback = bf.replace('.buffer', '.price.npy')
                 if os.path.exists(pf_fallback):
-                    price_deltas.append(np.load(pf_fallback))
+                    p_diff_block = np.load(pf_fallback)
                 else:
-                    tprint(f"Warning: Price file {pf} missing! Using zeros.")
-                    price_deltas.append(np.zeros(int(dm.num_row())))
+                    p_diff_block = np.zeros(int(dm.num_row()))
+            
+            pred_proba_block = bst.predict(dm)
+            
+            pred_proba_list.append(pred_proba_block)
+            y_true_list.append(y_block)
+            p_diff_raw_list.append(p_diff_block)
                     
         except Exception as e:
             tprint(f"Error processing block {bf}: {e}")
             continue
     
-    if not xs:
+    if not pred_proba_list:
         tprint("No valid data loaded.")
         return
 
-    X_all = sp.vstack(xs) if sp.issparse(xs[0]) else np.vstack(xs)
-    y_true = np.concatenate(ys).astype(int)
-    p_diff_raw = np.concatenate(price_deltas) # P(t+n) - P(t)
-    dtest = xgb.DMatrix(X_all, label=y_true)
+    pred_proba = np.vstack(pred_proba_list)
+    y_true = np.concatenate(y_true_list)
+    p_diff_raw = np.concatenate(p_diff_raw_list)
     
-    tprint(f"Total samples for testing: {len(y_true)}")
-
-    # 3. 执行预测
-    pred_proba = bst.predict(dtest) 
+    tprint(f"Total samples for testing: {len(y_true)}") 
 
     # 4. 置信度阈值扫描
     tprint("\n" + "="*135)
@@ -100,7 +103,7 @@ def evaluate_model(model_path, meta_path, data_dir, eval_threshold=0.88):
 
     actual_moves_mask = (y_true == 0) | (y_true == 2)
     total_actual_moves = np.sum(actual_moves_mask)
-    thresholds = [0.0, 0.35, 0.40, 0.50, 0.60, 0.65, 0.70, 0.75, 0.80, 0.81, 0.82, 0.83, 0.84, 0.85, 0.88, 0.90, 0.95]
+    thresholds = [0.0, 0.60, 0.65, 0.70, 0.72, 0.73, 0.74, 0.75, 0.78, 0.80, 0.81, 0.82, 0.83, 0.84, 0.85, 0.88, 0.90]
     
     for thr in thresholds:
         mask_down = pred_proba[:, 0] > thr
