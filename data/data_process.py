@@ -447,6 +447,11 @@ class DataProcessor:
         val_files = csv_files[split_file_idx:]
         return train_files, val_files
 
+    def _is_limit_up_down(self, df):
+        limit_up = (df['n_ask1'] == 0) | (df['n_close'] >= 0.095)
+        limit_down = (df['n_bid1'] == 0) | (df['n_close'] <= -0.095)
+        return limit_up | limit_down
+    
     def _process_and_save_binary_blocks(self, csv_files, label_name, window, available_features, meta_path, cache_dir, batch_size=5000):
         batch_features = []
         batch_labels = []
@@ -455,6 +460,7 @@ class DataProcessor:
         buffer_files = []
         buffer_idx = 0
         total_samples = 0
+        removed_limit_samples = 0
         
         n_shift = int(label_name.split('_')[1])
         base_name = os.path.splitext(os.path.basename(meta_path))[0]
@@ -489,6 +495,9 @@ class DataProcessor:
                 df = pd.read_csv(file)
                 df = df.sort_values(['sym', 'date', 'time']).reset_index(drop=True)
                 
+                limit_mask = self._is_limit_up_down(df)
+                removed_limit_samples += limit_mask.sum()
+                
                 df['price_diff_raw'] = df.groupby(['sym', 'date'])['n_midprice'].shift(-n_shift) - df['n_midprice']
                 
                 df = self._add_derived_features(df)
@@ -505,8 +514,15 @@ class DataProcessor:
                     group_features = feature_df.loc[group.index].values
                     group_labels = group[label_name].fillna(1).astype(int).values
                     group_diffs = group['price_diff_raw'].fillna(0).values
+                    group_limit_mask = limit_mask.loc[group.index].values
                     
                     for i in range(len(group)):
+                        if group_limit_mask[i]:
+                            continue
+                        
+                        if i < 4:
+                            continue
+                        
                         pyramid_vec = self._assemble_pyramid_vector(group_features, i, mid_idx, imb_idx)
                         batch_features.append(pyramid_vec)
                         label = int(group_labels[i])
@@ -533,6 +549,7 @@ class DataProcessor:
                 f.write(f'{buffer_file}\n')
         
         print(f"Saved {len(buffer_files)} binary DMatrix blocks to {meta_path} ({total_samples} total samples)")
+        print(f"Removed {removed_limit_samples} limit up/down samples")
         
         return label_counts
     
